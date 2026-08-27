@@ -90,6 +90,45 @@ def _win32_name(dll: str, func: str) -> str:
 _FALLBACK_PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL;.PY;.PYW"
 
 
+# KNOWNFOLDERID values from KnownFolders.h. Several environment variables map to
+# the same folder: ALLUSERSPROFILE mirrors ProgramData, and ProgramW6432 mirrors
+# ProgramFiles on a 64-bit process.
+_KNOWN_FOLDER_ENV_VARS: tuple[tuple[str, str], ...] = (
+    ("ProgramData", "{62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}"),
+    ("ALLUSERSPROFILE", "{62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}"),
+    ("PUBLIC", "{DFDF76A2-C82A-4D63-906A-5644AC457385}"),
+    ("ProgramFiles", "{6D809377-6AF0-444B-8957-A3773F02200E}"),
+    ("ProgramW6432", "{6D809377-6AF0-444B-8957-A3773F02200E}"),
+    ("ProgramFiles(x86)", "{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}"),
+    ("CommonProgramFiles", "{6365D5A7-0F0D-45E5-87F6-0DA56B6A4F7D}"),
+    ("CommonProgramW6432", "{6365D5A7-0F0D-45E5-87F6-0DA56B6A4F7D}"),
+    ("CommonProgramFiles(x86)", "{DE974D24-D9C6-4D3E-BF91-F4455120B917}"),
+)
+
+
+def _known_folder_path(folder_id: str) -> str | None:
+    """Resolve a KNOWNFOLDERID string to its filesystem path."""
+    ptr = ctypes.c_wchar_p()
+    try:
+        ole32 = ctypes.windll.ole32
+        guid = ctypes.create_string_buffer(16)
+        if ole32.CLSIDFromString(ctypes.c_wchar_p(folder_id), ctypes.byref(guid)) != 0:
+            return None
+        if ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(guid), 0, None, ctypes.byref(ptr)
+        ) != 0:
+            return None
+        return ptr.value or None
+    except Exception:
+        logger.debug("Failed to resolve known folder %s", folder_id, exc_info=True)
+        return None
+    finally:
+        if ptr:
+            try:
+                ctypes.windll.ole32.CoTaskMemFree(ptr)
+            except Exception:
+                logger.debug("Failed to free known folder path buffer", exc_info=True)
+
 def _prepare_env() -> dict[str, str]:
     """Prepare a complete environment block for the PowerShell subprocess.
 
@@ -167,6 +206,18 @@ def _prepare_env() -> dict[str, str]:
     # be missing on domain-joined hosts, so this is an acceptable last resort.
     env.setdefault("USERDOMAIN", env.get("COMPUTERNAME", ""))
 
+    # Known folders are synthesized by Windows when it builds a process
+    # environment block; they are not stored in the registry, so the reads above
+    # cannot recover them. Packaged (MSIX) MCP hosts hand down a block without
+    # them. Any tool that resolves its own configuration through these variables
+    # then fails: Win32 OpenSSH, for example, aborts during startup with exit
+    # code 255 and no diagnostics at all when ProgramData is absent, which makes
+    # every ssh/scp/sftp/ssh-keygen call look like an unexplained failure.
+    for _name, _folder_id in _KNOWN_FOLDER_ENV_VARS:
+        if not env.get(_name):
+            _path = _known_folder_path(_folder_id)
+            if _path:
+                env[_name] = _path
     return env
 
 
