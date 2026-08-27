@@ -1,6 +1,7 @@
 import logging
 import signal
 import subprocess
+import tempfile
 from xml.sax.saxutils import escape as xml_escape
 
 import psutil
@@ -34,6 +35,18 @@ def check_pid_exists(pid: int) -> bool:
         return False
 
 
+def _drain(handle) -> bytes | None:
+    """Read back everything written to a capture file. Never raises."""
+    if handle is None:
+        return None
+    try:
+        handle.seek(0)
+        return handle.read()
+    except Exception:
+        logger.debug("Failed to read back captured output.", exc_info=True)
+        return b""
+
+
 def run_with_graceful_timeout(
         *popenargs,
         input=None,
@@ -46,8 +59,8 @@ def run_with_graceful_timeout(
     """A Windows-oriented variant migrated from ``subprocess.run``.
 
     This helper keeps the overall calling style and behavior of
-    ``subprocess.run``, but adapts the timeout-handling path for some
-    Windows-specific edge cases as described below.
+    ``subprocess.run``, but adapts both the capture mechanism and the
+    timeout-handling path for some Windows-specific edge cases.
 
     Args:
         *popenargs: Positional arguments to pass to ``subprocess.Popen``.
@@ -58,26 +71,40 @@ def run_with_graceful_timeout(
         grace_period: Seconds to wait after CTRL_BREAK before force-killing. Defaults to 2.0.
 
     Notes:
-        In some Windows scenarios, especially when launching a console host
-        such as PowerShell and letting it start another interactive console
-        process or a process stuck in an infinite loop that continuously outputs data
-        (for example ``pwsh -> python``, like ``pwsh -NoProfile -Command python``
-        or ``pwsh -NoProfile -Command "python -c 'while True: print(1)'"``),
-        the standard timeout flow of ``subprocess.run`` may not be sufficient.
-        After a timeout occurs, simply terminating the top-level child process
-        may still leave descendant processes alive, or leave inherited pipe handles open.
-        As a result, the parent process can remain blocked while trying to
-        finish the final ``communicate()`` cleanup, and memory usage may continue to grow if
-        stdout/stderr are being captured.
+        Two distinct Windows problems are handled here.
 
-        To make this case more robust, this function changes the timeout path
-        into a two-stage shutdown strategy:
+        1. Orphaned descendants holding the capture handles.
 
-        1. First, try a graceful stop by sending ``CTRL_BREAK_EVENT`` to the
-           child process group, so console applications have a chance to exit
-           cleanly.
-        2. If that still does not finish within ``grace_period``, forcefully
-           terminate the whole process tree via ``taskkill /T /F``.
+        A command may spawn a detached grandchild and return immediately, for
+        example ``pwsh -> [Diagnostics.Process]::Start("cmd.exe", "/c ...")``.
+        The grandchild inherits the standard handles at creation time. When the
+        direct child exits, that grandchild is orphaned: its parent PID refers
+        to a dead process, so a ``taskkill /T`` on the child's PID cannot reach
+        it and it keeps the inherited handles open.
+
+        If those handles are pipes, the read end never reaches EOF, the reader
+        threads stay blocked, and closing the pipes on ``Popen.__exit__`` waits
+        for them. The call then blocks for as long as the orphan lives, even
+        though the direct child finished in milliseconds and ``timeout`` has
+        long since expired.
+
+        Capturing into temporary files instead of pipes removes the failure
+        mode entirely: an inherited file handle costs nothing to leave open,
+        there are no reader threads, and cleanup never waits on a descendant.
+        A detached job also keeps running, which is usually what the caller
+        wanted when they detached it.
+
+        2. Descendants that stay alive and keep producing output.
+
+        Where the direct child itself does not exit (for example
+        ``pwsh -NoProfile -Command "python -c 'while True: print(1)'"``),
+        terminating only the top-level process may leave descendants running.
+        The timeout path therefore keeps the two-stage shutdown:
+
+        a. Send ``CTRL_BREAK_EVENT`` to the child process group, so console
+           applications get a chance to exit cleanly.
+        b. If that does not finish within ``grace_period``, terminate the whole
+           tree via ``taskkill /T /F``.
 
         Related issues: #124, #146
     """
@@ -87,11 +114,15 @@ def run_with_graceful_timeout(
             raise ValueError("stdin and input arguments may not both be used.")
         kwargs["stdin"] = subprocess.PIPE
 
+    out_file = err_file = None
     if capture_output:
         if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
             raise ValueError("stdout and stderr arguments may not be used with capture_output.")
-        kwargs["stdout"] = subprocess.PIPE
-        kwargs["stderr"] = subprocess.PIPE
+        # Files, not pipes. See note 1 in the docstring.
+        out_file = tempfile.TemporaryFile()
+        err_file = tempfile.TemporaryFile()
+        kwargs["stdout"] = out_file
+        kwargs["stderr"] = err_file
 
     # Windows graceful-stop prerequisite: CREATE_NEW_PROCESS_GROUP is required
     # so that send_signal(CTRL_BREAK_EVENT) targets the child process group
@@ -100,66 +131,75 @@ def run_with_graceful_timeout(
     creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
     kwargs["creationflags"] = creationflags
 
-    with subprocess.Popen(*popenargs, **kwargs) as process:
-        stdout = stderr = None
-        try:
-            stdout, stderr = process.communicate(input=input, timeout=timeout)
-
-        except subprocess.TimeoutExpired as exc1:
-            # Try graceful shutdown first
-            logger.debug('Process did not exit within timeout, attempting graceful shutdown.')
+    try:
+        with subprocess.Popen(*popenargs, **kwargs) as process:
             try:
-                process.send_signal(signal.CTRL_BREAK_EVENT)
-            except Exception:
-                logger.debug('Failed to send CTRL_BREAK_EVENT, attempting to terminate process.')
+                if input is not None and process.stdin is not None:
+                    try:
+                        process.stdin.write(input)
+                    finally:
+                        process.stdin.close()
+                process.wait(timeout=timeout)
 
-            try:
-                exc1.stdout, exc1.stderr = process.communicate(timeout=grace_period)
-                logger.debug("Process exited after CTRL_BREAK, re-raising original TimeoutExpired.")
-                exc1.add_note("Process exited after graceful CTRL_BREAK shutdown.")
-                raise exc1  # (1)
-            except subprocess.TimeoutExpired as exc2:
-                if exc2 is exc1:  # Raised from the previous attempt (1)
-                    # No need to try further shutdown
-                    raise exc2
+            except subprocess.TimeoutExpired as exc:
+                logger.debug("Process did not exit within timeout, attempting graceful shutdown.")
+                try:
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                except Exception:
+                    logger.debug("Failed to send CTRL_BREAK_EVENT, will terminate the tree.")
 
-                # Kill the whole tree as a last resort
-                logger.debug(
-                    f"Process {process.pid} (exist: {check_pid_exists(process.pid)}) did not exit gracefully after {grace_period} seconds, killing it and all child processes..."
-                )
+                try:
+                    process.wait(timeout=grace_period)
+                    exc.add_note("Process exited after graceful CTRL_BREAK shutdown.")
+                except subprocess.TimeoutExpired:
+                    logger.debug(
+                        f"Process {process.pid} (exist: {check_pid_exists(process.pid)}) did not "
+                        f"exit gracefully after {grace_period} seconds, killing it and all child "
+                        f"processes..."
+                    )
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                    try:
+                        process.wait(timeout=grace_period)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    exc.add_note(
+                        f"Process killed after failing to exit gracefully within "
+                        f"{grace_period} seconds."
+                    )
+
+                exc.stdout = _drain(out_file)
+                exc.stderr = _drain(err_file)
+                raise
+
+            except BaseException:
+                # Keep cleanup strategy consistent with timeout path
+                logger.debug("Other exception occurred, attempting to kill process...")
                 subprocess.run(
                     ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     check=False,
                 )
+                raise
 
+            retcode = process.returncode
+            stdout = _drain(out_file)
+            stderr = _drain(err_file)
+            args = process.args
+    finally:
+        for handle in (out_file, err_file):
+            if handle is not None:
                 try:
-                    exc2.stdout, exc2.stderr = process.communicate(timeout=grace_period)
-                except subprocess.TimeoutExpired:
-                    # Do not replace the original timeout exception
-                    pass
+                    handle.close()
+                except Exception:
+                    logger.debug("Failed to close capture file.", exc_info=True)
 
-                exc2.add_note(
-                    f"Process killed after failing to exit gracefully within {grace_period} seconds."
-                )
-                raise exc2
+    if check and retcode:
+        raise subprocess.CalledProcessError(retcode, args, output=stdout, stderr=stderr)
 
-        except BaseException:
-            # Keep cleanup strategy consistent with timeout path
-            logger.debug('Other exception occurred, attempting to kill process...')
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-            raise
-
-        retcode = process.poll()
-        if check and retcode:
-            raise subprocess.CalledProcessError(
-                retcode, process.args, output=stdout, stderr=stderr
-            )
-
-        return subprocess.CompletedProcess(process.args, retcode, stdout, stderr)
+    return subprocess.CompletedProcess(args, retcode, stdout, stderr)
