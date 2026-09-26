@@ -1,15 +1,40 @@
-"""PowerShell tool — shell/command execution."""
+"""PowerShell tool — shell/command execution, plus PowerShellJob for long runs."""
+
+from typing import Literal
 
 from mcp.types import ToolAnnotations
 from windows_mcp.infrastructure import with_analytics
 from windows_mcp.powershell import PowerShellExecutor
+from windows_mcp.powershell import jobs
+from windows_mcp.powershell.service import job_finished_output, job_running_message
 from fastmcp import Context
+
+
+def _response(text: str, status: int | str) -> str:
+    return f"Response: {text}\nStatus Code: {status}"
 
 
 def register(mcp, *, get_desktop, get_analytics):
     @mcp.tool(
         name="PowerShell",
-        description="Shell/command execution. Keywords: shell, run, execute, cmd, terminal, command line, script. A comprehensive system tool for executing any PowerShell commands. Use it to navigate the file system, manage files and processes, and execute system-level operations. Capable of accessing web content (e.g., via Invoke-WebRequest), interacting with network resources, and performing complex administrative tasks. This tool provides full access to the underlying operating system capabilities, making it the primary interface for system automation, scripting, and deep system interaction.",
+        description=(
+            "Shell/command execution. Keywords: shell, run, execute, cmd, terminal, command line, script. "
+            "A comprehensive system tool for executing any PowerShell commands. Use it to navigate the file "
+            "system, manage files and processes, and execute system-level operations. Capable of accessing web "
+            "content (e.g., via Invoke-WebRequest), interacting with network resources, and performing complex "
+            "administrative tasks. This tool provides full access to the underlying operating system "
+            "capabilities, making it the primary interface for system automation, scripting, and deep system "
+            "interaction.\n\n"
+            "timeout is the hard limit in seconds: the command is killed when it expires (default 30). "
+            "Choose it to fit the work, e.g. 900 for a long build, ssh session or script; there is no upper "
+            "bound. A single tool call cannot last longer than about 200 s (the client gives up at 240 s), so "
+            "when timeout is larger than that and the command is still running after ~200 s, the call returns "
+            "early with the output so far, 'Status Code: running' and a job_id, and the command keeps running "
+            "in the background. Then use the PowerShellJob tool to wait for it, check its output, or kill it. "
+            "Do not use Start-Sleep polling loops for this. Output is read from files, so print progressively "
+            "(e.g. python -u) if you want to see it while the command runs. Interactive prompts are not "
+            "supported."
+        ),
         annotations=ToolAnnotations(
             title="PowerShell",
             readOnlyHint=False,
@@ -21,7 +46,75 @@ def register(mcp, *, get_desktop, get_analytics):
     @with_analytics(get_analytics(), "Powershell-Tool")
     def powershell_tool(command: str, timeout: int = 30, ctx: Context = None) -> str:
         try:
-            response, status_code = PowerShellExecutor.execute_command(command, timeout)
-            return f"Response: {response}\nStatus Code: {status_code}"
+            response, status_code, job_id = PowerShellExecutor.run(command, timeout)
+            if job_id is not None:
+                return _response(response, "running")
+            return _response(response, status_code)
         except Exception as e:
             raise
+
+    @mcp.tool(
+        name="PowerShellJob",
+        description=(
+            "Manage PowerShell commands that are still running in the background after the PowerShell tool "
+            "returned 'Status Code: running' with a job_id. action='wait' blocks up to wait_seconds (capped at "
+            "about 200 s per call) and returns the full output with the exit code once the command has finished, "
+            "or the latest output if it is still running; call it again to keep waiting. action='status' returns "
+            "immediately. action='kill' stops the command and its child processes. action='list' shows all jobs "
+            "(job_id not needed). tail_chars limits how much output is shown while the command is still running. "
+            "Jobs are forgotten if the Windows-MCP server restarts (the processes keep running)."
+        ),
+        annotations=ToolAnnotations(
+            title="PowerShellJob",
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=False,
+            openWorldHint=False,
+        ),
+    )
+    @with_analytics(get_analytics(), "PowerShellJob-Tool")
+    def powershell_job_tool(
+        job_id: str = "",
+        action: Literal["wait", "status", "kill", "list"] = "wait",
+        wait_seconds: int = 60,
+        tail_chars: int = 4000,
+        ctx: Context = None,
+    ) -> str:
+        if action == "list":
+            items = jobs.list_jobs()
+            if not items:
+                return _response("No jobs.", 0)
+            lines = []
+            for job in items:
+                code = "" if job.returncode is None else f", exit {job.returncode}"
+                lines.append(
+                    f"{job.id}: {job.state}{code}, {job.elapsed():.0f}s, PID {job.pid}, "
+                    f"hard timeout {job.hard_timeout:.0f}s: {job.command[:120]}"
+                )
+            return _response("\n".join(lines), 0)
+
+        job = jobs.get(job_id)
+        if job is None:
+            return _response(
+                f"Unknown job_id {job_id!r}. Use action='list' to see current jobs. Jobs are forgotten when the "
+                "Windows-MCP server restarts (their processes keep running).",
+                1,
+            )
+
+        tail = max(0, int(tail_chars))
+        waited = 0.0
+        if action == "kill":
+            jobs.kill(job)
+        elif action == "wait":
+            waited = float(max(0, min(int(wait_seconds), jobs.return_after())))
+            job.done.wait(waited)
+
+        if job.done.is_set():
+            output, status = job_finished_output(job)
+            head = f"{job.id} finished: {job.state}, exit {job.returncode}, after {job.elapsed():.0f}s."
+            return _response(f"{head}\n{output}", status)
+        if action == "kill":
+            return _response(
+                f"{job.id} could not be stopped yet: {job.note} Check again with action='status'.", 1
+            )
+        return _response(job_running_message(job, waited, tail), "running")

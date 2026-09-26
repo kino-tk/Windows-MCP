@@ -10,6 +10,7 @@ import shutil
 import subprocess
 
 from windows_mcp.desktop.utils import is_elevated
+from windows_mcp.powershell import jobs
 from windows_mcp.powershell.utils import run_with_graceful_timeout
 
 __all__ = ["PowerShellExecutor"]
@@ -221,6 +222,85 @@ def _prepare_env() -> dict[str, str]:
     return env
 
 
+def _build_invocation(command: str, shell: str | None) -> tuple[list[str], dict[str, str], str]:
+    """Return (args, env, cwd) for running *command* in PowerShell."""
+    # $OutputEncoding: controls how PS5.1 encodes output written to its stdout pipe.
+    # Without this set to UTF-8, PS5.1 uses the system codepage and native process
+    # stdout is silently lost when Python reads the pipe.
+    # [Console]::OutputEncoding: controls how PS decodes bytes from native exe stdout.
+    utf8_command = (
+        "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+        f"{command}"
+    )
+    encoded = base64.b64encode(utf8_command.encode("utf-16le")).decode("ascii")
+    env = _prepare_env()
+    # NO_COLOR suppresses ANSI escape sequences in pwsh 7.2+ (and many other CLI tools).
+    # PS5.1 has no ANSI output, so this is harmlessly ignored there.
+    # https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_ansi_terminals#disabling-ansi-output
+    env["NO_COLOR"] = "1"
+
+    shell = shell or ("pwsh" if shutil.which("pwsh") else "powershell")
+
+    args = [shell, "-NoProfile"]
+    # Only older Windows PowerShell (5.1) uses -OutputFormat Text successfully here
+    shell_name = os.path.basename(shell).lower().replace(".exe", "")
+    if shell_name == "powershell":
+        args.extend(["-OutputFormat", "Text"])
+    args.extend(["-EncodedCommand", encoded])
+    return args, env, os.path.expanduser(path="~")
+
+
+def _format_output(stdout: bytes | str | None, stderr: bytes | str | None, returncode: int | None) -> str:
+    # Handle both bytes and str output (subprocess behavior varies by environment)
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    output = stdout or stderr
+    # If the command failed with "Access is denied" and we aren't elevated, add a helpful hint
+    if returncode != 0 and output and "Access is denied" in output and not is_elevated():
+        output += (
+            "\n\nHINT: This command may require an elevated (Administrator) terminal. "
+            "The Windows-MCP server is currently running at a lower integrity level."
+        )
+    return output
+
+
+def job_running_message(job: jobs.Job, waited: float, tail_chars: int = 4000) -> str:
+    stdout, stderr = jobs.read_output(job, tail_chars)
+    lines = [
+        f"Still running after {job.elapsed():.0f}s (waited {waited:.0f}s in this call). "
+        f"The command continues in the background as {job.id} (PID {job.pid}); "
+        f"it is stopped at its hard timeout of {job.hard_timeout:.0f}s "
+        f"(at {job.deadline_text()}) if it has not finished.",
+        f'Use the PowerShellJob tool with job_id="{job.id}": action="wait" to wait for it '
+        f'(up to {jobs.return_after():.0f}s per call), action="status" for output so far, '
+        f'action="kill" to stop it.',
+        f"--- output so far (last {tail_chars} chars of each stream) ---",
+        stdout if stdout else "(no stdout yet)",
+    ]
+    if stderr:
+        lines += ["--- stderr so far ---", stderr]
+    return "\n".join(lines)
+
+
+def job_finished_output(job: jobs.Job) -> tuple[str, int]:
+    """Full output of a finished job, formatted like a normal call's."""
+    stdout, stderr = jobs.read_output(job)
+    body = _format_output(stdout, stderr, job.returncode)
+    if job.state == "timed_out":
+        head = (
+            f"{job.id} was stopped at its hard timeout of {job.hard_timeout:.0f}s. "
+            f"{job.note} Output up to that point:"
+        )
+        return f"{head}\n{body}", 1
+    if job.state == "killed":
+        head = f"{job.id} was killed after {job.elapsed():.0f}s. {job.note} Output up to that point:"
+        return f"{head}\n{body}", 1 if job.returncode is None else job.returncode
+    return body, job.returncode if job.returncode is not None else 1
+
+
 class PowerShellExecutor:
     """Static utility class for executing PowerShell commands."""
 
@@ -229,55 +309,44 @@ class PowerShellExecutor:
             command: str, timeout: int = 10, shell: str | None = None
     ) -> tuple[str, int]:
         try:
-            # $OutputEncoding: controls how PS5.1 encodes output written to its stdout pipe.
-            # Without this set to UTF-8, PS5.1 uses the system codepage and native process
-            # stdout is silently lost when Python reads the pipe.
-            # [Console]::OutputEncoding: controls how PS decodes bytes from native exe stdout.
-            utf8_command = (
-                "$OutputEncoding = [System.Text.Encoding]::UTF8; "
-                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-                f"{command}"
-            )
-            encoded = base64.b64encode(utf8_command.encode("utf-16le")).decode("ascii")
-            env = _prepare_env()
-            # NO_COLOR suppresses ANSI escape sequences in pwsh 7.2+ (and many other CLI tools).
-            # PS5.1 has no ANSI output, so this is harmlessly ignored there.
-            # https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_ansi_terminals#disabling-ansi-output
-            env["NO_COLOR"] = "1"
-
-            shell = shell or ("pwsh" if shutil.which("pwsh") else "powershell")
-
-            args = [shell, "-NoProfile"]
-            # Only older Windows PowerShell (5.1) uses -OutputFormat Text successfully here
-            shell_name = os.path.basename(shell).lower().replace(".exe", "")
-            if shell_name == "powershell":
-                args.extend(["-OutputFormat", "Text"])
-            args.extend(["-EncodedCommand", encoded])
-
+            args, env, cwd = _build_invocation(command, shell)
             result = run_with_graceful_timeout(
                 args,
                 stdin=subprocess.DEVNULL,  # Prevent child processes from inheriting the MCP pipe stdin
                 capture_output=True,  # No errors='ignore' - let subprocess return bytes
                 timeout=timeout,
-                cwd=os.path.expanduser(path="~"),
+                cwd=cwd,
                 env=env,
             )
-            # Handle both bytes and str output (subprocess behavior varies by environment)
-            stdout = result.stdout
-            stderr = result.stderr
-            if isinstance(stdout, bytes):
-                stdout = stdout.decode("utf-8", errors="replace")
-            if isinstance(stderr, bytes):
-                stderr = stderr.decode("utf-8", errors="replace")
-            output = stdout or stderr
-            # If the command failed with "Access is denied" and we aren't elevated, add a helpful hint
-            if result.returncode != 0 and "Access is denied" in output and not is_elevated():
-                output += (
-                    "\n\nHINT: This command may require an elevated (Administrator) terminal. "
-                    "The Windows-MCP server is currently running at a lower integrity level."
-                )
-            return output, result.returncode
+            return _format_output(result.stdout, result.stderr, result.returncode), result.returncode
         except subprocess.TimeoutExpired:
             return "Command execution timed out", 1
         except Exception as e:
             return f"Command execution failed: {type(e).__name__}: {e}", 1
+
+    @staticmethod
+    def run(
+            command: str, timeout: int = 30, shell: str | None = None
+    ) -> tuple[str, int | None, str | None]:
+        """Run *command*, handing it over as a job if it outlives one call.
+
+        Returns (output, status_code, job_id). When *timeout* does not exceed
+        ``jobs.return_after()`` this is exactly ``execute_command``. Otherwise
+        the command runs as a job; if it finishes within ``return_after()``
+        the result is identical to a normal call, and if not, the output so
+        far is returned with ``status_code`` None and the job id.
+        """
+        wait = jobs.return_after()
+        if timeout <= wait:
+            output, status = PowerShellExecutor.execute_command(command, timeout, shell)
+            return output, status, None
+        try:
+            args, env, cwd = _build_invocation(command, shell)
+            job = jobs.start(args, env=env, cwd=cwd, hard_timeout=timeout, command=command)
+        except Exception as e:
+            return f"Command execution failed: {type(e).__name__}: {e}", 1, None
+        if job.done.wait(wait):
+            output, status = job_finished_output(job)
+            jobs.forget(job)
+            return output, status, None
+        return job_running_message(job, wait), None, job.id

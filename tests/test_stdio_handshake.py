@@ -54,6 +54,7 @@ EXPECTED_TOOLS = {
     "MultiSelect",
     "Notification",
     "PowerShell",
+    "PowerShellJob",
     "Process",
     "Registry",
     "Scrape",
