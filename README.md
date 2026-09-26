@@ -53,6 +53,7 @@ Verified on 2026-09-26: a fresh clone started this way lists 21 tools, including
 | `1574769` | `powershell/jobs.py` (new), `powershell/service.py`, `tools/shell.py` | Background jobs for long PowerShell commands, and the new `PowerShellJob` tool. |
 | `cb96450` | `powershell/service.py` | Default `PYTHONIOENCODING=utf-8` for spawned shells, so non-ASCII text printed by Python is not garbled. |
 | `7d86103` | `powershell/jobs.py`, `tools/shell.py`, `__main__.py` | Bind every job to the server with a Windows Job Object, record each job in a metadata file, and clean up after an earlier server run at start. See [Job lifetime and cleanup](#job-lifetime-and-cleanup). |
+| `45098ab` | `powershell/jobs.py`, `__main__.py` | Sweep finished jobs and stray files on a schedule, so a server left running for days still cleans up. Retention and interval are configurable. |
 
 All paths are under `src/windows_mcp/`.
 
@@ -136,6 +137,13 @@ Every job is bound to the server process that started it. You never need to find
 
 How this works: each command is started suspended, placed in its own Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and only then resumed, so nothing it starts can escape the Job Object. When the command ends normally, the Job Object is released without killing. If a Job Object cannot be created, the job still runs: this is logged and recorded as `"job_object": false`, `kill` and the hard timeout fall back to `taskkill /T`, and the next server start still kills verified leftovers.
 
+**No depth limit.** Windows puts every process that a job's process starts into the same Job Object, at any depth, so there is no cut-off at children or grandchildren. Verified on 2026-09-26:
+
+- A chain of 7 processes, in which every intermediate generation had already exited (so the deepest one was an orphan several levels down and ignored CTRL_BREAK), was ended completely by `kill` and by closing the Job Object.
+- A child that asks to leave the Job Object (`CREATE_BREAKAWAY_FROM_JOB`) is refused with "access denied".
+
+What is not covered: a program that is not a descendant of the command, because Windows starts it on behalf of another process. Examples are a program launched through a Windows service, Task Scheduler, WMI (`Win32_Process.Create`), an out-of-process COM server, or with elevation (UAC). Such a program is outside the Job Object, just as it is outside the command's process tree. (This follows from how Windows creates those processes; it was not tested here.)
+
 **Files.** Each job keeps three files in `~/.windows-mcp/jobs`, named `<server PID>-<job id>`:
 
 | File | Content |
@@ -146,9 +154,10 @@ How this works: each command is started suspended, placed in its own Windows Job
 
 **When files are deleted.**
 
-- A finished job is kept for **6 hours after it ended**. After that its three files are deleted at the next cleanup point: server start, any new job, or any `PowerShellJob` call. Until then it stays in `list`.
+- A finished job is kept for **6 hours after it ended** (`WINDOWS_MCP_JOB_RETENTION_HOURS`). Until then it stays in `list`.
+- A sweeper thread in the server checks every **10 minutes** (`WINDOWS_MCP_JOB_SWEEP_INTERVAL`) and deletes the three files of every job past its retention. A server left running for days therefore still cleans up on schedule, even if no one touches it. Server start, any new job and any `PowerShellJob` call sweep as well.
 - A job that finishes within the first 200 s of its call is deleted right away, because its output was already returned.
-- Output files without a record (left by older versions of this fork) are deleted at server start once they are older than 10 minutes.
+- Files that no job record claims (for example output left by older versions of this fork) are deleted by the same sweep once they are older than 10 minutes.
 - Job numbers continue across restarts, so an id is never reused while an older job with it is still on disk.
 
 ### Tool call log
@@ -191,6 +200,8 @@ A call the host abandoned (illustrative values, in the format the server writes)
 |---|---|---|
 | `WINDOWS_MCP_JOB_RETURN_AFTER` | `200` | Seconds a call waits before handing a command over as a job (capped at 225) |
 | `WINDOWS_MCP_JOB_DIR` | `~/.windows-mcp/jobs` | Where job output and records are written |
+| `WINDOWS_MCP_JOB_RETENTION_HOURS` | `6` | How long a finished job is kept |
+| `WINDOWS_MCP_JOB_SWEEP_INTERVAL` | `600` | Seconds between scheduled sweeps |
 | `WINDOWS_MCP_CALLLOG` | `~/.windows-mcp/calls.log` | Call log path, or `off` to disable it |
 | `WINDOWS_MCP_CALLLOG_MAX_BYTES` | `1000000` | Rotation threshold in bytes |
 | `WINDOWS_MCP_CALLLOG_BACKUPS` | `3` | Older generations to keep |
@@ -200,7 +211,7 @@ A call the host abandoned (illustrative values, in the format the server writes)
 ### Notes
 
 - PowerShell reports a failing native command as exit code 1. Append `; exit $LASTEXITCODE` to pass the original code on. This is unchanged upstream behaviour.
-- Tests: 553 passed, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py`, `tests/test_job_lifecycle.py` and `tests/test_python_io_encoding.py`.
+- Tests: 557 passed, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py`, `tests/test_job_lifecycle.py` and `tests/test_python_io_encoding.py`.
 
 ### License
 
