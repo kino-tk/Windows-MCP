@@ -55,6 +55,7 @@ Verified on 2026-09-26: a fresh clone started this way lists 21 tools, including
 | `7d86103` | `powershell/jobs.py`, `tools/shell.py`, `__main__.py` | Bind every job to the server with a Windows Job Object, record each job in a metadata file, and clean up after an earlier server run at start. See [Job lifetime and cleanup](#job-lifetime-and-cleanup). |
 | `45098ab` | `powershell/jobs.py`, `__main__.py` | Sweep finished jobs and stray files on a schedule, so a server left running for days still cleans up. Retention and interval are configurable. |
 | `3768989` | `powershell/jobs.py`, `powershell/service.py`, `tools/shell.py`, `scripts/windows-mcp-jobs.ps1` (new) | Keep what a finished job left running bound to the job, even if its root process was killed from outside; add a script that reports every job record and, as a last resort, kills a verified PID. The scheduled sweep defaults to every 90 minutes. |
+| `3ff68c0` | `filesystem/service.py`, `tools/filesystem.py` | FileSystem `write` no longer turns every `\n` into `\r\n`; a new `line_ending` argument chooses `keep`, `lf` or `crlf`. See [Line endings in FileSystem write](#line-endings-in-filesystem-write). |
 
 Paths are under `src/windows_mcp/`, except `scripts/`.
 
@@ -251,6 +252,32 @@ What is not covered: a program that is not a descendant of the command, because 
 
 This example sweeps every 10 minutes and keeps finished jobs for 24 hours. The server reads its environment only when it starts, so **restart Claude Desktop completely** (tray icon and any Claude processes in Task Manager included) for the change to take effect. Remove the lines to go back to the defaults (90 minutes, 6 hours).
 
+### Line endings in FileSystem write
+
+Upstream, the `FileSystem` tool's `write` mode opens files in text mode, so on Windows every `\n` becomes `\r\n` and files meant for Linux always come out with CRLF line endings. In this fork the line endings are exactly what you ask for:
+
+```text
+FileSystem  mode=write path=<file> content=<text> [append=true] [encoding=<name>] [line_ending=keep|lf|crlf]
+```
+
+| `line_ending` | Result |
+|---|---|
+| `keep` (default) | The content is written exactly as given. Text sent with `\n` stays LF; an explicit `\r\n` stays CRLF. |
+| `lf` | Every line break becomes LF, the Linux line ending. |
+| `crlf` | Every line break becomes CRLF, for files such as `.bat` or `.cmd` that need it. An existing `\r\n` is not doubled. |
+
+`append=true` follows the same rule. Windows Notepad reads and keeps LF files correctly since Windows 10 version 1809 (it shows "Unix (LF)" in the status bar), so LF is safe for files you also open on Windows.
+
+To change the default for every write, set `WINDOWS_MCP_WRITE_LINE_ENDING` in the `env` block of the server's entry in `claude_desktop_config.json` (the same place as the cleanup settings above), then restart Claude Desktop completely:
+
+```json
+"env": {
+  "WINDOWS_MCP_WRITE_LINE_ENDING": "lf"
+}
+```
+
+An explicit `line_ending` argument always wins over the default. An unknown value in the environment variable is ignored (the default stays `keep`); an unknown argument value is reported as an error and nothing is written.
+
 ### Tool call log
 
 Every tool call writes a `start` and an `end` record to `~/.windows-mcp/calls.log` as JSON lines, plus a `cancelled` record if the host gives up first. Jobs add `job_start` and `job_end` records, and `job_adopted` when a new server takes over the record of a job from an earlier run.
@@ -296,13 +323,15 @@ A call the host abandoned (illustrative values, in the format the server writes)
 | `WINDOWS_MCP_CALLLOG` | `~/.windows-mcp/calls.log` | Call log path, or `off` to disable it |
 | `WINDOWS_MCP_CALLLOG_MAX_BYTES` | `1000000` | Rotation threshold in bytes |
 | `WINDOWS_MCP_CALLLOG_BACKUPS` | `3` | Older generations to keep |
+| `WINDOWS_MCP_WRITE_LINE_ENDING` | `keep` | Default line endings for FileSystem `write`: `keep`, `lf` or `crlf` |
 
 `PYTHONIOENCODING` is set to `utf-8` only when it is not already set, and a command can still override it.
 
 ### Notes
 
 - PowerShell reports a failing native command as exit code 1. Append `; exit $LASTEXITCODE` to pass the original code on. This is unchanged upstream behaviour.
-- Tests: 561 passed, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py`, `tests/test_job_lifecycle.py` and `tests/test_python_io_encoding.py`.
+- Text output is UTF-8 end to end for PowerShell itself and for the programs checked on 2026-09-26 (`cmd`, `dir`, `where`, `findstr`, git, node, and Python with the default above). The exception is older tools that read text piped into them in the system's ANSI code page, such as `sort.exe` on a Japanese system; setting `[Console]::InputEncoding` does not change that. Use the PowerShell equivalent (`Sort-Object`) instead.
+- Tests: 571 passed, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py`, `tests/test_job_lifecycle.py`, `tests/test_python_io_encoding.py` and `tests/test_line_endings.py`.
 
 ### License
 
