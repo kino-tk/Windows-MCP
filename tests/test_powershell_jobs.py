@@ -141,20 +141,6 @@ def test_job_start_and_end_are_logged(job_env):
     assert mine[1]["state"] == "exited" and mine[1]["returncode"] == 0
 
 
-def test_stale_files_from_old_runs_are_swept(job_env):
-    job_env.mkdir(parents=True, exist_ok=True)
-    old = job_env / "999-job-1.out"
-    old.write_text("x")
-    two_days = time.time() - 2 * 86400
-    os.utime(old, (two_days, two_days))
-    fresh = job_env / "999-job-2.out"
-    fresh.write_text("y")
-    jobs._stale_swept = False
-    PowerShellExecutor.run("'x'", timeout=600)
-    assert not old.exists()
-    assert fresh.exists()
-
-
 def _text(result) -> str:
     return result.content[0].text
 

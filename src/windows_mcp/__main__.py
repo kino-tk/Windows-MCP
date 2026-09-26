@@ -236,10 +236,24 @@ def _build_mcp() -> FastMCP:
         try:
             if watchdog:
                 watchdog.start()
+            # Clean up after an earlier server run: end leftover job processes
+            # (verified by PID and creation time) and adopt their records.
+            try:
+                from windows_mcp.powershell import jobs as _jobs
+
+                logger.debug("Job reconcile at start: %s", await asyncio.to_thread(_jobs.reconcile))
+            except Exception:
+                logger.warning("Job reconcile at start failed", exc_info=True)
             logger.debug("Server started, entering main loop")
             yield
         finally:
-            logger.debug("Shutting down: stopping watchdog and analytics")
+            logger.debug("Shutting down: stopping jobs, watchdog and analytics")
+            try:
+                from windows_mcp.powershell import jobs as _jobs
+
+                await asyncio.to_thread(_jobs.shutdown)
+            except Exception:
+                logger.warning("Stopping jobs at shutdown failed", exc_info=True)
             if watchdog:
                 watchdog.stop()
             if analytics:

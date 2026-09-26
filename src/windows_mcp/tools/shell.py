@@ -62,7 +62,8 @@ def register(mcp, *, get_desktop, get_analytics):
             "or the latest output if it is still running; call it again to keep waiting. action='status' returns "
             "immediately. action='kill' stops the command and its child processes. action='list' shows all jobs "
             "(job_id not needed). tail_chars limits how much output is shown while the command is still running. "
-            "Jobs are forgotten if the Windows-MCP server restarts (the processes keep running)."
+            "Every job is bound to the Windows-MCP server: if the server exits, the job's whole process tree ends "
+            "with it, and after a restart the job is listed as killed with its output still readable for 6 hours."
         ),
         annotations=ToolAnnotations(
             title="PowerShellJob",
@@ -80,6 +81,7 @@ def register(mcp, *, get_desktop, get_analytics):
         tail_chars: int = 4000,
         ctx: Context = None,
     ) -> str:
+        jobs.sweep()
         if action == "list":
             items = jobs.list_jobs()
             if not items:
@@ -87,8 +89,9 @@ def register(mcp, *, get_desktop, get_analytics):
             lines = []
             for job in items:
                 code = "" if job.returncode is None else f", exit {job.returncode}"
+                origin = " (from an earlier server run)" if job.adopted else ""
                 lines.append(
-                    f"{job.id}: {job.state}{code}, {job.elapsed():.0f}s, PID {job.pid}, "
+                    f"{job.id}: {job.state}{code}{origin}, {job.elapsed():.0f}s, PID {job.pid}, "
                     f"hard timeout {job.hard_timeout:.0f}s: {job.command[:120]}"
                 )
             return _response("\n".join(lines), 0)
@@ -96,8 +99,8 @@ def register(mcp, *, get_desktop, get_analytics):
         job = jobs.get(job_id)
         if job is None:
             return _response(
-                f"Unknown job_id {job_id!r}. Use action='list' to see current jobs. Jobs are forgotten when the "
-                "Windows-MCP server restarts (their processes keep running).",
+                f"Unknown job_id {job_id!r}. Use action='list' to see current jobs. Finished jobs are deleted "
+                "6 hours after they end.",
                 1,
             )
 
