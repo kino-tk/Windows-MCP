@@ -1,3 +1,70 @@
+> [!NOTE]
+> **This is a fork of [CursorTouch/Windows-MCP](https://github.com/CursorTouch/Windows-MCP)**, based on upstream `main` at `a868ed6` (version 0.8.5) and maintained by [kino-tk](https://github.com/kino-tk).
+> It adds reliability fixes for the PowerShell tool when the server runs under an MSIX-packaged MCP host such as Claude Desktop, and background jobs for long commands.
+> The changes are intended to be offered upstream as separate pull requests. The original README follows unchanged after this section.
+
+## About this fork
+
+### Why
+
+Under Claude Desktop, an MSIX-packaged host, the PowerShell tool had four practical problems:
+
+1. **Calls hung after the command had finished.** A detached grandchild inherited the capture pipes, so the reader never saw EOF.
+2. **`ssh`, `scp` and `sftp` failed with exit code 255 and no output.** The packaged host hands down an environment block without `ProgramData` and the other known-folder variables, and Win32 OpenSSH aborts before it even parses its arguments.
+3. **Anything longer than about four minutes was cut off.** The host abandons a tool call after 240 s, and a server cannot extend that.
+4. **When a call did hang, nothing showed which tool or command it was.** The host's log records only that a `tools/call` was sent.
+
+### Changes
+
+| Commit | Change |
+|---|---|
+| `fc33e7f` | Capture output into temporary files instead of pipes, so an orphaned grandchild cannot block the call. Measured on a 60 s detached job with `timeout=5`: 63.3 s of blocking before, immediate return after. See upstream [#124](https://github.com/CursorTouch/Windows-MCP/issues/124) and [#146](https://github.com/CursorTouch/Windows-MCP/issues/146). |
+| `ed6cc0a` | Restore `ProgramData`, `ALLUSERSPROFILE`, `PUBLIC`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramW6432` and their `CommonProgram*` counterparts through `SHGetKnownFolderPath` when the host strips them. Only missing variables are filled. |
+| `f789895` | Bound every wait on a child process tree. `taskkill` gets a 10 s limit, and the `Popen` is no longer a context manager, because its `__exit__` ends in an unbounded `wait()`. Before: a child that ignores CTRL_BREAK held a call for 30.1 s against a 1 s timeout. Also adds a tool call log. |
+| `1574769` | Background jobs for long PowerShell commands, and a new `PowerShellJob` tool. |
+| `cb96450` | Default `PYTHONIOENCODING=utf-8` for spawned shells, so non-ASCII text printed by Python is not garbled. |
+
+### Long commands: `timeout` and `PowerShellJob`
+
+- `timeout` on the PowerShell tool is the hard limit chosen by the caller. The command is killed when it expires (default 30 s, no upper bound).
+- If `timeout` is longer than about 200 s and the command is still running at that point, the call returns early with the output so far, `Status Code: running` and a `job_id`. The command keeps running.
+- `PowerShellJob` then manages it: `wait` (up to about 200 s per call), `status`, `kill` (the whole process tree) or `list`.
+- A command that finishes within 200 s returns exactly what a plain call would. Calls with `timeout` of 200 s or less take the original code path unchanged.
+- Output is written to files under `~/.windows-mcp/jobs`, so it can be read while the command runs. Programs must print progressively to show partial output (for Python, use `-u`). Interactive prompts are not supported.
+- Jobs live in the server process. If the server restarts, the job list is lost but the processes keep running. Finished jobs are kept for 6 hours; files left by an earlier server process are removed after 24 hours.
+
+Verified under Claude Desktop: a 302-second `ssh` command with `timeout=600` returned `job-1` after 200 s, and `PowerShellJob` collected the full output with exit code 0.
+
+### Tool call log
+
+Every tool call writes a `start` and an `end` record to `~/.windows-mcp/calls.log` as JSON lines, plus a `cancelled` record if the host gives up first. A call stuck inside the server shows up as a `start` without an `end`. For sync tools the `end` record is written from the worker thread, so it shows when the work really stopped.
+
+- Commands are truncated to 200 characters. Free-text arguments (`content`, `text`, `value`, `data`, `input`) are logged by length only.
+- The file rotates at 1 MB and keeps 3 older generations, about 4 MB in total.
+
+### Environment variables added by this fork
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WINDOWS_MCP_JOB_RETURN_AFTER` | `200` | Seconds a call waits before handing a command over as a job (capped at 225) |
+| `WINDOWS_MCP_JOB_DIR` | `~/.windows-mcp/jobs` | Where job output files are written |
+| `WINDOWS_MCP_CALLLOG` | `~/.windows-mcp/calls.log` | Call log path, or `off` to disable it |
+| `WINDOWS_MCP_CALLLOG_MAX_BYTES` | `1000000` | Rotation threshold in bytes |
+| `WINDOWS_MCP_CALLLOG_BACKUPS` | `3` | Older generations to keep |
+
+`PYTHONIOENCODING` is set to `utf-8` only when it is not already set, and a command can still override it.
+
+### Notes
+
+- PowerShell reports a failing native command as exit code 1. Append `; exit $LASTEXITCODE` to pass the original code on. This is unchanged upstream behaviour.
+- Tests: 542 passed, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py` and `tests/test_python_io_encoding.py`.
+
+### License
+
+MIT, the same as upstream. Copyright (c) 2025 JEOMON GEORGE; see [LICENSE.md](LICENSE.md). The changes in this fork are provided under the same license.
+
+---
+
 <div align="center">
   <h1>🪟 Windows-MCP</h1>
 
