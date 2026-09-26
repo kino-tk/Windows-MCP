@@ -354,6 +354,9 @@ class PowerShellExecutor:
             return f"Command execution failed: {type(e).__name__}: {e}", 1, None
         if job.done.wait(wait):
             output, status = job_finished_output(job)
+            # Finished within the first call: behave exactly like a plain call,
+            # so a process the command deliberately left running keeps running.
+            jobs.release(job)
             jobs.forget(job)
             return output, status, None
         return job_running_message(job, wait), None, job.id

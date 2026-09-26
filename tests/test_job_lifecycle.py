@@ -55,6 +55,9 @@ TREE = textwrap.dedent(
         print("grand", g, flush=True)
         if mode == "root-exit":
             sys.exit(0)
+        if mode == "root-exit-late":
+            time.sleep(3)  # outlive the first call, then exit and leave the grandchild
+            sys.exit(0)
         time.sleep(120)
     """
 )
@@ -403,6 +406,67 @@ def test_a_child_cannot_break_away(env):
     assert "refused 5" in text and "escaped" not in text
 
 
+# --- leftovers of a finished job stay under control ---------------------------
+
+
+def test_leftovers_of_a_long_job_stay_bound_and_kill_ends_them(env):
+    job, grand = _start(env, mode="root-exit-late")
+    assert job.done.wait(20) and job.state == "exited"
+    assert _alive(grand)
+    assert jobs.leftovers(job) >= 1
+    jobs.kill(job)
+    assert _gone_within([grand], 5), "leftover survived kill of a finished job"
+    assert jobs.leftovers(job) == 0 and "leftover" in job.note
+
+
+def test_deleting_a_job_ends_its_leftovers(env):
+    job, grand = _start(env, mode="root-exit-late")
+    assert job.done.wait(20)
+    assert _alive(grand)
+    jobs.forget(job)
+    assert _gone_within([grand], 5), "leftover survived deletion of its job"
+
+
+def test_root_killed_from_outside_then_server_death_ends_everything(env):
+    """Regression: an external kill of the root must not release the tree."""
+    helper = env["tmp"] / "server2.py"
+    helper.write_text(
+        textwrap.dedent(
+            f"""
+            import os, site, sys, time
+            for d in os.environ["TEST_SITE_DIRS"].split(os.pathsep):
+                site.addsitedir(d)
+            from windows_mcp.powershell import PowerShellExecutor, jobs
+            out, status, job_id = PowerShellExecutor.run({_tree_cmd(env['tree'])!r}, timeout=600)
+            job = jobs.get(job_id)
+            while "grand " not in jobs.read_output(job)[0]:
+                time.sleep(0.2)
+            grand = [l for l in jobs.read_output(job)[0].splitlines() if l.startswith("grand ")][0].split()[1]
+            print(job.pid, grand, flush=True)
+            job.done.wait(60)
+            print("root-ended", job.state, jobs.leftovers(job), flush=True)
+            time.sleep(120)
+            """
+        ),
+        encoding="utf-8",
+    )
+    server = subprocess.Popen(
+        [PY, "-S", "-u", str(helper)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_server_env()
+    )
+    env["spawned"].append(server.pid)
+    first = server.stdout.readline()
+    if not first:
+        pytest.fail("helper server failed to start:\n" + server.stderr.read()[-2000:])
+    root, grand = (int(x) for x in first.split())
+    env["spawned"] += [root, grand]
+    subprocess.run(["taskkill", "/PID", str(root), "/T", "/F"], capture_output=True)
+    ended = server.stdout.readline().split()
+    assert ended[0] == "root-ended" and int(ended[2]) >= 1, ended
+    assert _alive(grand), "the orphaned grandchild should still be bound, not dead yet"
+    psutil.Process(server.pid).kill()
+    assert _gone_within([grand], 10), "a leftover outlived its server after the root was killed externally"
+
+
 # --- scheduled cleanup --------------------------------------------------------
 
 
@@ -437,3 +501,15 @@ def test_sweeper_is_idempotent_and_stops(env, monkeypatch):
     jobs.stop_sweeper()
     first.join(2)
     assert not first.is_alive() and jobs._sweeper is None
+
+
+def test_cleanup_defaults_and_overrides(monkeypatch):
+    monkeypatch.delenv("WINDOWS_MCP_JOB_SWEEP_INTERVAL", raising=False)
+    monkeypatch.delenv("WINDOWS_MCP_JOB_RETENTION_HOURS", raising=False)
+    assert jobs.sweep_interval() == 5400  # 90 minutes
+    assert jobs.retention_seconds() == 6 * 3600
+    monkeypatch.setenv("WINDOWS_MCP_JOB_SWEEP_INTERVAL", "600")
+    monkeypatch.setenv("WINDOWS_MCP_JOB_RETENTION_HOURS", "24")
+    assert jobs.sweep_interval() == 600 and jobs.retention_seconds() == 24 * 3600
+    monkeypatch.setenv("WINDOWS_MCP_JOB_SWEEP_INTERVAL", "not a number")
+    assert jobs.sweep_interval() == 5400

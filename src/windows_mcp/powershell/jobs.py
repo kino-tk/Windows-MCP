@@ -15,14 +15,20 @@ created with ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``. The command is started
 suspended, put into the Job Object, then resumed, so no descendant can escape
 before binding. Consequences:
 
-* ``kill`` and the hard timeout end the whole tree, including grandchildren
-  whose parent has already exited (``taskkill /T`` cannot find those).
+* ``kill`` and the hard timeout end the whole tree, at any depth, including
+  descendants whose parent has already exited (``taskkill /T`` cannot find
+  those).
 * If the server exits for any reason, including a crash or being killed, the
-  OS closes the Job Object handle and every process of every running job
-  ends with it. A job can never outlive its server unsupervised.
-* When a command ends normally, the Job Object is released without killing,
-  so a process the command deliberately left running (``Start-Process``)
-  survives, the same as with a plain call.
+  OS closes the Job Object handle and every process of every job ends with
+  it. A job can never outlive its server unsupervised.
+* When the command of a job that was handed back as a job ends, the Job
+  Object is kept: anything it left running stays bound to the job (``list``
+  shows it as leftover), ends on ``kill``, and ends when the job is deleted or
+  the server exits. This holds however the command ended, including when its
+  root process was killed from outside.
+* A command that finishes within its first call is released instead, so a
+  process it deliberately left running (``Start-Process``) survives, the same
+  as with a plain call.
 
 Records
 -------
@@ -44,7 +50,7 @@ Cleanup
 A finished job is kept for ``retention_seconds()`` (6 h by default,
 ``WINDOWS_MCP_JOB_RETENTION_HOURS``) after it ended, then its three files are
 deleted. A sweeper thread started with the server checks every
-``sweep_interval()`` seconds (10 min by default,
+``sweep_interval()`` seconds (90 min by default,
 ``WINDOWS_MCP_JOB_SWEEP_INTERVAL``), so a server left running for days still
 cleans up on schedule; server start, any job start and any PowerShellJob call
 also sweep. Output files without metadata (left by older versions) are
@@ -97,7 +103,7 @@ DEFAULT_RETURN_AFTER = 200.0
 # Stay clear of the host's 240 s limit, leaving time for the reply to travel.
 MAX_RETURN_AFTER = 225.0
 RETENTION_SECONDS = 6 * 3600
-DEFAULT_SWEEP_INTERVAL = 600.0
+DEFAULT_SWEEP_INTERVAL = 5400.0  # 90 min
 MIN_SWEEP_INTERVAL = 0.1
 ORPHAN_FILE_GRACE_SECONDS = 600
 GRACE_SECONDS = 2.0
@@ -269,6 +275,29 @@ def _close_job_object(job: Job) -> None:
             logger.debug("Closing Job Object for %s failed", job.id, exc_info=True)
 
 
+def _leftovers(job: Job) -> int:
+    """Processes still alive in the job's Job Object (0 if it has none)."""
+    if job.job_object is None:
+        return 0
+    try:
+        info = win32job.QueryInformationJobObject(job.job_object, win32job.JobObjectBasicAccountingInformation)
+        return int(info["ActiveProcesses"])
+    except Exception:
+        logger.debug("Could not query Job Object for %s", job.id, exc_info=True)
+        return 0
+
+
+def leftovers(job: Job) -> int:
+    """Processes the finished command left running that are still bound to the job."""
+    return _leftovers(job) if job.done.is_set() else 0
+
+
+def release(job: Job) -> None:
+    """Let processes a finished command left running go free (plain-call behaviour)."""
+    if job.done.is_set():
+        _release_job_object(job)
+
+
 def _resume(process: subprocess.Popen) -> None:
     status = ctypes.windll.ntdll.NtResumeProcess(ctypes.c_void_p(int(process._handle)))
     if status != 0:
@@ -409,10 +438,13 @@ def _finish(job: Job, state: str) -> None:
         job.returncode = job.process.poll() if job.process is not None else None
         job.ended = time.time()
         job.state = state
-    if state == "exited":
-        _release_job_object(job)
-    else:
+    if state != "exited":
+        # The tree was already ended; closing the handle ends any straggler.
         _close_job_object(job)
+    # For "exited" the Job Object is kept: anything the command left running
+    # stays bound to the job until it is killed, deleted, or the server exits.
+    # (A job that finished within its first call is released by the caller,
+    # which then behaves exactly like a plain call.)
     _write_meta(job)
     job.done.set()
     calllog.record(
@@ -438,8 +470,22 @@ def list_jobs() -> list[Job]:
 
 
 def kill(job: Job, wait: float = 5.0, reason: str = "") -> None:
-    """Stop the job's whole process tree. Bounded; returns even if it survives."""
-    if job.done.is_set() or job.process is None:
+    """Stop the job's whole process tree. Bounded; returns even if it survives.
+
+    For a finished job, this ends any processes the command left running.
+    """
+    if job.done.is_set():
+        count = _leftovers(job)
+        if count and job.job_object is not None:
+            try:
+                win32job.TerminateJobObject(job.job_object, 1)
+                job.note = (job.note + f" {count} leftover process(es) were ended by kill.").strip()
+            except Exception:
+                logger.warning("Could not end leftovers of %s", job.id, exc_info=True)
+            _close_job_object(job)
+            _write_meta(job)
+        return
+    if job.process is None:
         return
     job.kill_requested = True
     note = _stop_tree(job)
@@ -453,8 +499,11 @@ def shutdown() -> None:
     stop_sweeper()
     with _lock:
         running = [j for j in _jobs.values() if not j.done.is_set() and j.process is not None]
+        finished = [j for j in _jobs.values() if j.done.is_set() and j.job_object is not None]
     for job in running:
         kill(job, wait=3.0, reason="Stopped because the Windows-MCP server shut down.")
+    for job in finished:
+        _close_job_object(job)  # ends leftovers, as the OS would on exit
 
 
 def _read_tail(path: Path, tail_chars: int | None) -> str:
@@ -480,9 +529,14 @@ def read_output(job: Job, tail_chars: int | None = None) -> tuple[str, str]:
 
 
 def forget(job: Job) -> None:
-    """Drop a finished job and delete its output and metadata."""
+    """Drop a finished job and delete its output and metadata.
+
+    If the job still holds its Job Object, closing it ends anything the
+    command left running. Call ``release`` first to let such processes go.
+    """
     if not job.done.is_set():
         return
+    _close_job_object(job)
     with _lock:
         _jobs.pop(job.id, None)
     for path in (job.out_path, job.err_path, job.meta_path):

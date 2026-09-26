@@ -90,8 +90,10 @@ def register(mcp, *, get_desktop, get_analytics):
             for job in items:
                 code = "" if job.returncode is None else f", exit {job.returncode}"
                 origin = " (from an earlier server run)" if job.adopted else ""
+                left = jobs.leftovers(job)
+                rest = f", {left} leftover process(es)" if left else ""
                 lines.append(
-                    f"{job.id}: {job.state}{code}{origin}, {job.elapsed():.0f}s, PID {job.pid}, "
+                    f"{job.id}: {job.state}{code}{origin}{rest}, {job.elapsed():.0f}s, PID {job.pid}, "
                     f"hard timeout {job.hard_timeout:.0f}s: {job.command[:120]}"
                 )
             return _response("\n".join(lines), 0)
@@ -115,6 +117,12 @@ def register(mcp, *, get_desktop, get_analytics):
         if job.done.is_set():
             output, status = job_finished_output(job)
             head = f"{job.id} finished: {job.state}, exit {job.returncode}, after {job.elapsed():.0f}s."
+            left = jobs.leftovers(job)
+            if left:
+                head += (
+                    f" {left} process(es) it started are still running and stay bound to this job; "
+                    f"action='kill' ends them, and they end when the job is deleted or the server exits."
+                )
             return _response(f"{head}\n{output}", status)
         if action == "kill":
             return _response(
