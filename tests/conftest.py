@@ -7,6 +7,9 @@ import pytest
 # can crash the interpreter. Tests for the flash itself set/clear this env var
 # explicitly via monkeypatch.
 os.environ.setdefault("WINDOWS_MCP_DISABLE_FLASH", "1")
+# Keep the suite from appending to the user's real ~/.windows-mcp/calls.log.
+# Call-log tests point WINDOWS_MCP_CALLLOG at a temp file via monkeypatch.
+os.environ.setdefault("WINDOWS_MCP_CALLLOG", "off")
 
 from windows_mcp.tree.views import BoundingBox, Center, TreeElementNode, ScrollElementNode
 from windows_mcp.desktop.views import Window, Status, DesktopState

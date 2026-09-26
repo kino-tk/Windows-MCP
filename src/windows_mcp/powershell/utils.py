@@ -8,11 +8,18 @@ import psutil
 
 __all__ = [
     "run_with_graceful_timeout",
+    "kill_process_tree",
+    "terminate_gracefully",
     "ps_quote",
     "ps_quote_for_xml",
 ]
 
 logger = logging.getLogger(__name__)
+
+# ``taskkill`` is itself a process and can block, for example while a member of
+# the tree is stuck in uninterruptible I/O. Every call to it is bounded by this.
+TASKKILL_TIMEOUT = 10.0
+_TASKKILL_CMD = ["taskkill", "/T", "/F", "/PID"]
 
 
 def ps_quote(value: str) -> str:
@@ -33,6 +40,71 @@ def check_pid_exists(pid: int) -> bool:
         return proc.status() not in (psutil.STATUS_DEAD, psutil.STATUS_ZOMBIE)
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False
+
+
+def kill_process_tree(pid: int, timeout: float | None = None) -> bool:
+    """Force-kill *pid* and its descendants with ``taskkill /T /F``.
+
+    Bounded by *timeout* (``TASKKILL_TIMEOUT`` by default). An unbounded
+    ``taskkill`` used to hold a tool call past the host's request timeout when
+    the tree could not be torn down. Returns False if taskkill did not finish
+    in time or could not be started. Never raises.
+    """
+    limit = TASKKILL_TIMEOUT if timeout is None else timeout
+    try:
+        subprocess.run(
+            [*_TASKKILL_CMD, str(pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=limit,
+        )
+        return True
+    except subprocess.TimeoutExpired:
+        logger.warning("taskkill for PID %s did not finish within %.1fs", pid, limit)
+        return False
+    except Exception:
+        logger.debug("taskkill for PID %s failed to run", pid, exc_info=True)
+        return False
+
+
+def terminate_gracefully(process: subprocess.Popen, grace_period: float = 2.0) -> str:
+    """Stop *process* and its tree: CTRL_BREAK first, then ``taskkill``.
+
+    *process* must have been created with ``CREATE_NEW_PROCESS_GROUP``. Every
+    wait is bounded, so this returns within roughly
+    ``2 * grace_period + TASKKILL_TIMEOUT`` even if the tree cannot be killed.
+    Returns a short note describing what happened.
+    """
+    try:
+        process.send_signal(signal.CTRL_BREAK_EVENT)
+    except Exception:
+        logger.debug("Failed to send CTRL_BREAK_EVENT, will terminate the tree.")
+
+    try:
+        process.wait(timeout=grace_period)
+        return "Process exited after graceful CTRL_BREAK shutdown."
+    except subprocess.TimeoutExpired:
+        pass
+
+    logger.debug(
+        f"Process {process.pid} (exist: {check_pid_exists(process.pid)}) did not "
+        f"exit gracefully after {grace_period} seconds, killing it and all child "
+        f"processes..."
+    )
+    killed = kill_process_tree(process.pid)
+    try:
+        process.wait(timeout=grace_period)
+    except subprocess.TimeoutExpired:
+        return (
+            f"Process could not be killed (taskkill {'ran' if killed else 'timed out'}); "
+            f"it may still be running."
+        )
+    return (
+        f"Process killed after failing to exit gracefully within "
+        f"{grace_period} seconds."
+    )
 
 
 def _drain(handle) -> bytes | None:
@@ -132,7 +204,12 @@ def run_with_graceful_timeout(
     kwargs["creationflags"] = creationflags
 
     try:
-        with subprocess.Popen(*popenargs, **kwargs) as process:
+        # Not a ``with`` block: ``Popen.__exit__`` ends in an unbounded
+        # ``wait()``, so a tree that survived taskkill would hold the call
+        # forever. Windows has no zombies to reap; closing our handles is
+        # enough, and every wait below is bounded.
+        process = subprocess.Popen(*popenargs, **kwargs)
+        try:
             try:
                 if input is not None and process.stdin is not None:
                     try:
@@ -143,35 +220,7 @@ def run_with_graceful_timeout(
 
             except subprocess.TimeoutExpired as exc:
                 logger.debug("Process did not exit within timeout, attempting graceful shutdown.")
-                try:
-                    process.send_signal(signal.CTRL_BREAK_EVENT)
-                except Exception:
-                    logger.debug("Failed to send CTRL_BREAK_EVENT, will terminate the tree.")
-
-                try:
-                    process.wait(timeout=grace_period)
-                    exc.add_note("Process exited after graceful CTRL_BREAK shutdown.")
-                except subprocess.TimeoutExpired:
-                    logger.debug(
-                        f"Process {process.pid} (exist: {check_pid_exists(process.pid)}) did not "
-                        f"exit gracefully after {grace_period} seconds, killing it and all child "
-                        f"processes..."
-                    )
-                    subprocess.run(
-                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                    )
-                    try:
-                        process.wait(timeout=grace_period)
-                    except subprocess.TimeoutExpired:
-                        pass
-                    exc.add_note(
-                        f"Process killed after failing to exit gracefully within "
-                        f"{grace_period} seconds."
-                    )
-
+                exc.add_note(terminate_gracefully(process, grace_period))
                 exc.stdout = _drain(out_file)
                 exc.stderr = _drain(err_file)
                 raise
@@ -179,18 +228,20 @@ def run_with_graceful_timeout(
             except BaseException:
                 # Keep cleanup strategy consistent with timeout path
                 logger.debug("Other exception occurred, attempting to kill process...")
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
+                kill_process_tree(process.pid)
                 raise
 
             retcode = process.returncode
             stdout = _drain(out_file)
             stderr = _drain(err_file)
             args = process.args
+        finally:
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        logger.debug("Failed to close process pipe.", exc_info=True)
     finally:
         for handle in (out_file, err_file):
             if handle is not None:

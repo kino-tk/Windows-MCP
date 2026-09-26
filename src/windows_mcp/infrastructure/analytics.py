@@ -1,5 +1,6 @@
 from typing import Dict, Any, TypeVar, Callable, Protocol, Awaitable
 from windows_mcp.infrastructure.config import CONFIG_DIR
+from windows_mcp.infrastructure import calllog
 from uuid_extensions import uuid7str
 from fastmcp import Context
 from functools import wraps
@@ -10,6 +11,7 @@ import asyncio
 import logging
 import time
 import os
+import re
 
 
 logger = logging.getLogger(__name__)
@@ -144,9 +146,27 @@ class PostHogAnalytics:
             logger.debug("Closed analytics")
 
 
+_STATUS_CODE_RE = re.compile(r"Status Code: (\S+)\s*$")
+
+
+def _end_fields(result: Any, started: float) -> dict[str, Any]:
+    fields: dict[str, Any] = {"status": "ok", "duration_ms": int((time.time() - started) * 1000)}
+    if isinstance(result, str):
+        fields["result_chars"] = len(result)
+        match = _STATUS_CODE_RE.search(result[-80:])
+        if match:
+            fields["exit"] = match.group(1)
+    return fields
+
+
 def with_analytics(analytics_instance: Analytics | None, tool_name: str):
     """
     Decorator to wrap tool functions with analytics tracking.
+
+    Also writes ``start``/``end``/``cancelled`` records to the call log (see
+    ``calllog``). For sync tools the ``end`` record is written from the worker
+    thread, so it reflects when the work really stopped even if the host has
+    already cancelled the request.
     """
 
     def decorator(func: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
@@ -176,12 +196,49 @@ def with_analytics(analytics_instance: Analytics | None, tool_name: str):
             except Exception:
                 pass
 
+            call_id = calllog.new_call_id()
+            calllog.record(
+                "start",
+                call_id,
+                tool_name,
+                args=calllog.summarize_args(kwargs),
+                **({"client": client_data["client_name"]} if client_data.get("client_name") else {}),
+            )
+
+            def _logged_call():
+                try:
+                    value = func(*args, **kwargs)
+                except BaseException as exc:
+                    calllog.record(
+                        "end",
+                        call_id,
+                        tool_name,
+                        status=f"error:{type(exc).__name__}",
+                        duration_ms=int((time.time() - start) * 1000),
+                    )
+                    raise
+                calllog.record("end", call_id, tool_name, **_end_fields(value, start))
+                return value
+
             try:
                 if inspect.iscoroutinefunction(func):
-                    result = await func(*args, **kwargs)
+                    try:
+                        result = await func(*args, **kwargs)
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException as exc:
+                        calllog.record(
+                            "end",
+                            call_id,
+                            tool_name,
+                            status=f"error:{type(exc).__name__}",
+                            duration_ms=int((time.time() - start) * 1000),
+                        )
+                        raise
+                    calllog.record("end", call_id, tool_name, **_end_fields(result, start))
                 else:
                     # Run sync function in thread to avoid blocking loop
-                    result = await asyncio.to_thread(func, *args, **kwargs)
+                    result = await asyncio.to_thread(_logged_call)
 
                 duration_ms = int((time.time() - start) * 1000)
 
@@ -192,6 +249,14 @@ def with_analytics(analytics_instance: Analytics | None, tool_name: str):
                     )
 
                 return result
+            except asyncio.CancelledError:
+                calllog.record(
+                    "cancelled",
+                    call_id,
+                    tool_name,
+                    after_ms=int((time.time() - start) * 1000),
+                )
+                raise
             except Exception as error:
                 duration_ms = int((time.time() - start) * 1000)
                 if analytics_instance:
