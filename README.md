@@ -14,33 +14,111 @@ Under Claude Desktop, an MSIX-packaged host, the PowerShell tool had four practi
 3. **Anything longer than about four minutes was cut off.** The host abandons a tool call after 240 s, and a server cannot extend that.
 4. **When a call did hang, nothing showed which tool or command it was.** The host's log records only that a `tools/call` was sent.
 
+### Installation
+
+The upstream instructions further down (`uvx windows-mcp`, PyPI, the Claude Desktop extension) install the upstream package, which does **not** include these changes. To use this fork, run it from a clone:
+
+1. Clone the fork. [uv](https://docs.astral.sh/uv/) is required; it fetches Python 3.14 and the dependencies on the first run.
+
+   ```powershell
+   git clone https://github.com/kino-tk/Windows-MCP-private.git C:\path\to\Windows-MCP-private
+   ```
+
+2. Add the server to `claude_desktop_config.json` (for Claude Desktop: `%APPDATA%\Claude\claude_desktop_config.json`, also reachable from Settings → Developer → Edit Config):
+
+   ```json
+   {
+     "mcpServers": {
+       "windows-mcp": {
+         "command": "uv",
+         "args": ["--directory", "C:\\path\\to\\Windows-MCP-private", "run", "windows-mcp", "serve"]
+       }
+     }
+   }
+   ```
+
+   If Claude Desktop cannot find `uv`, give its full path in `command` (run `where uv` to see it).
+
+3. **Restart Claude Desktop** to load the server. Quit it completely, including the tray icon and any Claude processes left in Task Manager, then start it again. The same applies after every `git pull`: the running server keeps the old code until the restart.
+
+Verified on 2026-09-26: a fresh clone started this way lists 21 tools, including `PowerShellJob`.
+
 ### Changes
 
-| Commit | Change |
-|---|---|
-| `fc33e7f` | Capture output into temporary files instead of pipes, so an orphaned grandchild cannot block the call. Measured on a 60 s detached job with `timeout=5`: 63.3 s of blocking before, immediate return after. See upstream [#124](https://github.com/CursorTouch/Windows-MCP/issues/124) and [#146](https://github.com/CursorTouch/Windows-MCP/issues/146). |
-| `ed6cc0a` | Restore `ProgramData`, `ALLUSERSPROFILE`, `PUBLIC`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramW6432` and their `CommonProgram*` counterparts through `SHGetKnownFolderPath` when the host strips them. Only missing variables are filled. |
-| `f789895` | Bound every wait on a child process tree. `taskkill` gets a 10 s limit, and the `Popen` is no longer a context manager, because its `__exit__` ends in an unbounded `wait()`. Before: a child that ignores CTRL_BREAK held a call for 30.1 s against a 1 s timeout. Also adds a tool call log. |
-| `1574769` | Background jobs for long PowerShell commands, and a new `PowerShellJob` tool. |
-| `cb96450` | Default `PYTHONIOENCODING=utf-8` for spawned shells, so non-ASCII text printed by Python is not garbled. |
+| Commit | Source files | Change |
+|---|---|---|
+| `fc33e7f` | `powershell/utils.py` | Capture output into temporary files instead of pipes, so an orphaned grandchild cannot block the call. Measured on a 60 s detached job with `timeout=5`: 63.3 s of blocking before, immediate return after. See upstream [#124](https://github.com/CursorTouch/Windows-MCP/issues/124) and [#146](https://github.com/CursorTouch/Windows-MCP/issues/146). |
+| `ed6cc0a` | `powershell/service.py` | Restore `ProgramData`, `ALLUSERSPROFILE`, `PUBLIC`, `ProgramFiles`, `ProgramFiles(x86)`, `ProgramW6432` and their `CommonProgram*` counterparts through `SHGetKnownFolderPath` when the host strips them. Only missing variables are filled. |
+| `f789895` | `powershell/utils.py`, `infrastructure/calllog.py` (new), `infrastructure/analytics.py` | Bound every wait on a child process tree. `taskkill` gets a 10 s limit, and the `Popen` is no longer a context manager, because its `__exit__` ends in an unbounded `wait()`. Before: a child that ignores CTRL_BREAK held a call for 30.1 s against a 1 s timeout. Also adds the tool call log. |
+| `1574769` | `powershell/jobs.py` (new), `powershell/service.py`, `tools/shell.py` | Background jobs for long PowerShell commands, and the new `PowerShellJob` tool. |
+| `cb96450` | `powershell/service.py` | Default `PYTHONIOENCODING=utf-8` for spawned shells, so non-ASCII text printed by Python is not garbled. |
+
+All paths are under `src/windows_mcp/`.
 
 ### Long commands: `timeout` and `PowerShellJob`
 
 - `timeout` on the PowerShell tool is the hard limit chosen by the caller. The command is killed when it expires (default 30 s, no upper bound).
 - If `timeout` is longer than about 200 s and the command is still running at that point, the call returns early with the output so far, `Status Code: running` and a `job_id`. The command keeps running.
-- `PowerShellJob` then manages it: `wait` (up to about 200 s per call), `status`, `kill` (the whole process tree) or `list`.
-- A command that finishes within 200 s returns exactly what a plain call would. Calls with `timeout` of 200 s or less take the original code path unchanged.
+- A command that finishes within 200 s returns exactly what a plain call would.
+- Calls whose `timeout` is 200 s or less take the pre-job code path (`execute_command`), which still has the bounded waits added in `f789895`.
 - Output is written to files under `~/.windows-mcp/jobs`, so it can be read while the command runs. Programs must print progressively to show partial output (for Python, use `-u`). Interactive prompts are not supported.
 - Jobs live in the server process. If the server restarts, the job list is lost but the processes keep running. Finished jobs are kept for 6 hours; files left by an earlier server process are removed after 24 hours.
 
-Verified under Claude Desktop: a 302-second `ssh` command with `timeout=600` returned `job-1` after 200 s, and `PowerShellJob` collected the full output with exit code 0.
+`PowerShellJob` arguments:
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `action` | `wait` | `wait`, `status`, `kill` or `list` |
+| `job_id` | `""` | The job id returned by the PowerShell tool. Not needed for `list`. |
+| `wait_seconds` | `60` | For `wait`: how long to block, capped at about 200 s per call |
+| `tail_chars` | `4000` | While the command is still running: how much of the latest stdout and stderr to show |
+
+- `wait` returns the full output and the exit code once the command has finished; if it is still running, it returns the latest output with `Status Code: running`, and you call `wait` again.
+- `status` returns at once. `kill` stops the command and all its child processes. `list` shows every job with its state.
+
+Example (a 302-second `ssh` command, as verified under Claude Desktop):
+
+```text
+PowerShell(command="ssh host 'long-task.sh'", timeout=600)
+  -> Still running after 200s (waited 200s in this call). The command continues in the
+     background as job-1 (PID 4196); it is stopped at its hard timeout of 600s ...
+     --- output so far ---
+     ...
+     Status Code: running
+
+PowerShellJob(action="wait", job_id="job-1", wait_seconds=200)
+  -> job-1 finished: exited, exit 0, after 302s.
+     <full output>
+     Status Code: 0
+```
 
 ### Tool call log
 
-Every tool call writes a `start` and an `end` record to `~/.windows-mcp/calls.log` as JSON lines, plus a `cancelled` record if the host gives up first. A call stuck inside the server shows up as a `start` without an `end`. For sync tools the `end` record is written from the worker thread, so it shows when the work really stopped.
+Every tool call writes a `start` and an `end` record to `~/.windows-mcp/calls.log` as JSON lines, plus a `cancelled` record if the host gives up first. Commands that become jobs also get `job_start` and `job_end` records.
 
+- `id` is `<server PID>-<sequence>` and pairs a call's `start`, `cancelled` and `end`. Job records use the job id.
+- `tool` is the server's internal label (for example `Powershell-Tool`), not the MCP tool name.
+- A call stuck inside the server shows up as a `start` without an `end`.
+- For sync tools the `end` record is written from the worker thread, so after a `cancelled` it still shows when the work really stopped.
 - Commands are truncated to 200 characters. Free-text arguments (`content`, `text`, `value`, `data`, `input`) are logged by length only.
 - The file rotates at 1 MB and keeps 3 older generations, about 4 MB in total.
+
+A call that became a job (real records; only the command is replaced):
+
+```json
+{"ts": "2026-09-26T09:21:06.411+09:00", "event": "start", "id": "9696-1", "tool": "Powershell-Tool", "args": {"command": "ssh host 'long-task.sh'", "timeout": 600}, "client": "claude-ai"}
+{"ts": "2026-09-26T09:21:06.447+09:00", "event": "job_start", "id": "job-1", "tool": "PowerShell", "pid": 4196, "hard_timeout": 600.0, "command": "ssh host 'long-task.sh'"}
+{"ts": "2026-09-26T09:24:26.471+09:00", "event": "end", "id": "9696-1", "tool": "Powershell-Tool", "status": "ok", "duration_ms": 200059, "result_chars": 788, "exit": "running"}
+{"ts": "2026-09-26T09:26:07.956+09:00", "event": "job_end", "id": "job-1", "tool": "PowerShell", "state": "exited", "returncode": 0, "duration_ms": 301509}
+```
+
+A call the host abandoned (illustrative values, in the format the server writes):
+
+```json
+{"ts": "2026-09-26T10:00:00.010+09:00", "event": "start", "id": "9696-7", "tool": "Screenshot-Tool", "args": {}, "client": "claude-ai"}
+{"ts": "2026-09-26T10:04:00.012+09:00", "event": "cancelled", "id": "9696-7", "tool": "Screenshot-Tool", "after_ms": 240002}
+{"ts": "2026-09-26T10:05:13.550+09:00", "event": "end", "id": "9696-7", "tool": "Screenshot-Tool", "status": "ok", "duration_ms": 313540, "result_chars": 5120}
+```
 
 ### Environment variables added by this fork
 
