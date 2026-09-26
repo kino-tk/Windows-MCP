@@ -239,6 +239,13 @@ def _build_invocation(command: str, shell: str | None) -> tuple[list[str], dict[
     # PS5.1 has no ANSI output, so this is harmlessly ignored there.
     # https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_ansi_terminals#disabling-ansi-output
     env["NO_COLOR"] = "1"
+    # Python writes redirected stdout in the ANSI code page (cp932 on Japanese
+    # Windows) unless told otherwise, while output is decoded as UTF-8 here, so
+    # non-ASCII text printed by Python came back garbled. This is only a
+    # default: a value the host already set wins, and a command can still
+    # override it with $env:PYTHONIOENCODING. File I/O (open()) is unaffected.
+    if not env.get("PYTHONIOENCODING"):
+        env["PYTHONIOENCODING"] = "utf-8"
 
     shell = shell or ("pwsh" if shutil.which("pwsh") else "powershell")
 
