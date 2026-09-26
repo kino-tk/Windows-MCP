@@ -87,7 +87,7 @@ if (-not (Test-Path -LiteralPath $JobDir)) {
 }
 
 $records = @()
-foreach ($f in Get-ChildItem -LiteralPath $JobDir -Filter *.json | Sort-Object Name) {
+foreach ($f in Get-ChildItem -LiteralPath $JobDir -Filter *.json | Where-Object { $_.Name -match '^\d+-job-\d+\.json$' } | Sort-Object Name) {
     try {
         $d = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {

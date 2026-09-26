@@ -63,6 +63,7 @@ import ctypes
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -109,6 +110,10 @@ ORPHAN_FILE_GRACE_SECONDS = 600
 GRACE_SECONDS = 2.0
 META_VERSION = 1
 _CREATE_SUSPENDED = 0x00000004
+# Only files with exactly these names are ever read as records or deleted, so
+# WINDOWS_MCP_JOB_DIR pointing at a shared folder cannot cost anyone a file.
+_JOB_RECORD_RE = re.compile(r"^\d+-job-\d+\.json$")
+_JOB_FILE_RE = re.compile(r"^\d+-job-\d+(?:\.out|\.err|\.json\.tmp)$")
 
 _jobs: dict[str, Job] = {}
 _lock = threading.Lock()
@@ -558,7 +563,11 @@ def sweep() -> None:
 
 
 def _remove_stray_files(now: float) -> int:
-    """Delete old files that no job record claims. Returns how many."""
+    """Delete old job output files that no job record claims. Returns how many.
+
+    Only names of the form ``<digits>-job-<digits>.out|.err|.json.tmp`` are
+    considered; any other file in the directory is never touched.
+    """
     directory = job_dir()
     if not directory.is_dir():
         return 0
@@ -568,11 +577,13 @@ def _remove_stray_files(now: float) -> int:
         return 0
     claimed = set()
     for name in names:
-        if name.endswith(".json"):
+        if _JOB_RECORD_RE.match(name):
             stem = name[: -len(".json")]
-            claimed.update({name, f"{stem}.out", f"{stem}.err"})
+            claimed.update({f"{stem}.out", f"{stem}.err"})
     removed = 0
     for name in names - claimed:
+        if not _JOB_FILE_RE.match(name):
+            continue
         path = directory / name
         try:
             if path.is_file() and now - path.stat().st_mtime > ORPHAN_FILE_GRACE_SECONDS:
@@ -645,7 +656,7 @@ def reconcile() -> dict[str, int]:
     me = _identity()
     highest = 0
 
-    for meta_path in sorted(directory.glob("*.json")):
+    for meta_path in sorted(p for p in directory.glob("*.json") if _JOB_RECORD_RE.match(p.name)):
         try:
             data = json.loads(meta_path.read_text(encoding="utf-8"))
             number = int(str(data["id"]).rsplit("-", 1)[1])

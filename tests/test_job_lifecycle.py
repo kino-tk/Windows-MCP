@@ -513,3 +513,25 @@ def test_cleanup_defaults_and_overrides(monkeypatch):
     assert jobs.sweep_interval() == 600 and jobs.retention_seconds() == 24 * 3600
     monkeypatch.setenv("WINDOWS_MCP_JOB_SWEEP_INTERVAL", "not a number")
     assert jobs.sweep_interval() == 5400
+
+
+def test_cleanup_never_touches_files_that_are_not_job_files(env):
+    """WINDOWS_MCP_JOB_DIR may point at a shared folder; only job files may go."""
+    jobdir = env["jobdir"]
+    jobdir.mkdir(parents=True, exist_ok=True)
+    old = time.time() - jobs.ORPHAN_FILE_GRACE_SECONDS - 3600
+    unrelated = ["notes.txt", "data.json", "report.out", "12-report.out", "job-3.out", "1-job-x.err"]
+    ours = ["123-job-4.out", "123-job-4.err", "123-job-5.json.tmp"]
+    for name in unrelated + ours:
+        (jobdir / name).write_text("x")
+        os.utime(jobdir / name, (old, old))
+    (jobdir / "data.json").write_text('{"id": "job-7", "not": "a job record"}')
+    os.utime(jobdir / "data.json", (old, old))
+
+    counts = jobs.reconcile()
+    jobs.sweep()
+    for name in unrelated:
+        assert (jobdir / name).exists(), f"cleanup deleted an unrelated file: {name}"
+    for name in ours:
+        assert not (jobdir / name).exists(), f"stray job file kept: {name}"
+    assert counts["adopted"] == 0 and jobs.get("job-7") is None
