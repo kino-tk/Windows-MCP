@@ -70,6 +70,7 @@ def env(tmp_path, monkeypatch):
     tree.write_text(TREE, encoding="utf-8")
     spawned: list[int] = []
     yield {"jobdir": jobdir, "tree": tree, "spawned": spawned, "tmp": tmp_path}
+    jobs.stop_sweeper()
     for job in list(jobs._jobs.values()):
         if not job.done.is_set():
             jobs.kill(job)
@@ -340,3 +341,99 @@ def test_job_numbers_continue_after_a_restart(env):
     jobs.reconcile()
     job, grand = _start(env)
     assert int(job.id.split("-")[1]) >= 42
+
+
+# --- no depth limit, no escape ------------------------------------------------
+
+CHAIN = textwrap.dedent(
+    """
+    import os, signal, subprocess, sys, time
+    depth, maxd = int(sys.argv[1]), int(sys.argv[2])
+    if depth < maxd:
+        p = subprocess.Popen([sys.executable, __file__, str(depth + 1), sys.argv[2]], stdout=subprocess.PIPE, text=True)
+        rest = p.stdout.readline().strip()
+        print(os.getpid(), rest, flush=True)
+        if depth >= 1:
+            sys.exit(0)  # every intermediate generation exits, leaving orphans below it
+        time.sleep(120)
+    else:
+        signal.signal(signal.SIGBREAK, signal.SIG_IGN)
+        print(os.getpid(), flush=True)
+        time.sleep(120)
+    """
+)
+
+
+def test_kill_ends_every_generation(env):
+    chain = env["tmp"] / "chain.py"
+    chain.write_text(CHAIN, encoding="utf-8")
+    out, status, job_id = PowerShellExecutor.run(f"& '{PY}' -u '{chain}' 0 6", timeout=600)
+    job = jobs.get(job_id)
+    deadline = time.monotonic() + 20
+    pids = []
+    while len(pids) < 7 and time.monotonic() < deadline:
+        first = jobs.read_output(job)[0].strip().splitlines()
+        pids = [int(x) for x in first[0].split()] if first else []
+        time.sleep(0.2)
+    assert len(pids) == 7, pids
+    env["spawned"].extend(pids)
+    deepest = pids[-1]
+    assert _alive(deepest) and not any(_alive(p) for p in pids[1:-1])
+    jobs.kill(job)
+    assert _gone_within(pids, 5), "a descendant several generations down survived"
+
+
+def test_a_child_cannot_break_away(env):
+    script = env["tmp"] / "breakaway.py"
+    script.write_text(
+        "import subprocess, sys\n"
+        "try:\n"
+        "    subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], creationflags=0x01000000)\n"
+        "    print('escaped')\n"
+        "except OSError as e:\n"
+        "    print('refused', e.winerror)\n",
+        encoding="utf-8",
+    )
+    out, status, job_id = PowerShellExecutor.run(
+        f"& '{PY}' -u '{script}'; Start-Sleep 3", timeout=600
+    )
+    job = jobs.get(job_id)
+    assert job.done.wait(20)
+    text = jobs.read_output(job)[0]
+    assert "refused 5" in text and "escaped" not in text
+
+
+# --- scheduled cleanup --------------------------------------------------------
+
+
+def test_sweeper_cleans_up_without_any_other_activity(env, monkeypatch):
+    monkeypatch.setenv("WINDOWS_MCP_JOB_RETENTION_HOURS", str(1 / 3600))  # 1 s
+    monkeypatch.setenv("WINDOWS_MCP_JOB_SWEEP_INTERVAL", "0.3")
+    out, status, job_id = PowerShellExecutor.run(f"& '{PY}' -c \"import time; time.sleep(3)\"", timeout=600)
+    job = jobs.get(job_id)
+    assert job.done.wait(20)
+    files = [job.out_path, job.err_path, job.meta_path]
+    assert all(p.exists() for p in files)
+    stray = env["jobdir"] / "999-job-9.out"
+    stray.write_text("x")
+    old = time.time() - jobs.ORPHAN_FILE_GRACE_SECONDS - 60
+    os.utime(stray, (old, old))
+
+    jobs.start_sweeper()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and (any(p.exists() for p in files) or stray.exists()):
+        time.sleep(0.1)
+    assert not any(p.exists() for p in files), "expired job not swept on schedule"
+    assert not stray.exists(), "stray file not swept on schedule"
+    assert jobs.get(job_id) is None
+
+
+def test_sweeper_is_idempotent_and_stops(env, monkeypatch):
+    monkeypatch.setenv("WINDOWS_MCP_JOB_SWEEP_INTERVAL", "0.2")
+    jobs.start_sweeper()
+    first = jobs._sweeper
+    jobs.start_sweeper()
+    assert jobs._sweeper is first and first.is_alive()
+    jobs.stop_sweeper()
+    first.join(2)
+    assert not first.is_alive() and jobs._sweeper is None

@@ -41,11 +41,14 @@ live server are left alone.
 
 Cleanup
 -------
-A finished job is kept for ``RETENTION_SECONDS`` (6 h) after it ended, then
-its three files are deleted. Deletion happens at the next cleanup point:
-server start, any job start, or any PowerShellJob call. Output files without
-metadata (left by older versions) are deleted at server start once they are
-older than ``ORPHAN_FILE_GRACE_SECONDS``.
+A finished job is kept for ``retention_seconds()`` (6 h by default,
+``WINDOWS_MCP_JOB_RETENTION_HOURS``) after it ended, then its three files are
+deleted. A sweeper thread started with the server checks every
+``sweep_interval()`` seconds (10 min by default,
+``WINDOWS_MCP_JOB_SWEEP_INTERVAL``), so a server left running for days still
+cleans up on schedule; server start, any job start and any PowerShellJob call
+also sweep. Output files without metadata (left by older versions) are
+deleted once they are older than ``ORPHAN_FILE_GRACE_SECONDS``.
 """
 
 from __future__ import annotations
@@ -84,6 +87,8 @@ __all__ = [
     "reconcile",
     "shutdown",
     "sweep",
+    "start_sweeper",
+    "stop_sweeper",
 ]
 
 logger = logging.getLogger(__name__)
@@ -92,6 +97,8 @@ DEFAULT_RETURN_AFTER = 200.0
 # Stay clear of the host's 240 s limit, leaving time for the reply to travel.
 MAX_RETURN_AFTER = 225.0
 RETENTION_SECONDS = 6 * 3600
+DEFAULT_SWEEP_INTERVAL = 600.0
+MIN_SWEEP_INTERVAL = 0.1
 ORPHAN_FILE_GRACE_SECONDS = 600
 GRACE_SECONDS = 2.0
 META_VERSION = 1
@@ -101,6 +108,26 @@ _jobs: dict[str, Job] = {}
 _lock = threading.Lock()
 _next_number = 1
 _server_identity: tuple[int, float] | None = None
+_sweeper: threading.Thread | None = None
+_sweeper_stop = threading.Event()
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def retention_seconds() -> float:
+    """How long a finished job is kept (WINDOWS_MCP_JOB_RETENTION_HOURS)."""
+    hours = _env_float("WINDOWS_MCP_JOB_RETENTION_HOURS", RETENTION_SECONDS / 3600)
+    return max(0.0, hours * 3600)
+
+
+def sweep_interval() -> float:
+    """Seconds between background sweeps (WINDOWS_MCP_JOB_SWEEP_INTERVAL)."""
+    return max(MIN_SWEEP_INTERVAL, _env_float("WINDOWS_MCP_JOB_SWEEP_INTERVAL", DEFAULT_SWEEP_INTERVAL))
 
 
 def return_after() -> float:
@@ -422,7 +449,8 @@ def kill(job: Job, wait: float = 5.0, reason: str = "") -> None:
 
 
 def shutdown() -> None:
-    """Stop every running job; called when the server shuts down normally."""
+    """Stop every running job and the sweeper; called when the server shuts down normally."""
+    stop_sweeper()
     with _lock:
         running = [j for j in _jobs.values() if not j.done.is_set() and j.process is not None]
     for job in running:
@@ -465,12 +493,67 @@ def forget(job: Job) -> None:
 
 
 def sweep() -> None:
-    """Delete finished jobs older than the retention period."""
+    """Delete finished jobs past the retention period, and stray old files."""
     now = time.time()
+    keep = retention_seconds()
     with _lock:
-        expired = [j for j in _jobs.values() if j.ended is not None and now - j.ended > RETENTION_SECONDS]
+        expired = [j for j in _jobs.values() if j.ended is not None and now - j.ended > keep]
     for job in expired:
         forget(job)
+    _remove_stray_files(now)
+
+
+def _remove_stray_files(now: float) -> int:
+    """Delete old files that no job record claims. Returns how many."""
+    directory = job_dir()
+    if not directory.is_dir():
+        return 0
+    try:
+        names = {p.name for p in directory.iterdir()}
+    except OSError:
+        return 0
+    claimed = set()
+    for name in names:
+        if name.endswith(".json"):
+            stem = name[: -len(".json")]
+            claimed.update({name, f"{stem}.out", f"{stem}.err"})
+    removed = 0
+    for name in names - claimed:
+        path = directory / name
+        try:
+            if path.is_file() and now - path.stat().st_mtime > ORPHAN_FILE_GRACE_SECONDS:
+                path.unlink()
+                removed += 1
+        except OSError:
+            logger.debug("Could not remove stray job file %s", path, exc_info=True)
+    return removed
+
+
+def _sweeper_loop() -> None:
+    while not _sweeper_stop.wait(sweep_interval()):
+        try:
+            sweep()
+        except Exception:
+            logger.warning("Background job sweep failed", exc_info=True)
+
+
+def start_sweeper() -> None:
+    """Start the background sweeper thread (idempotent)."""
+    global _sweeper
+    with _lock:
+        if _sweeper is not None and _sweeper.is_alive():
+            return
+        _sweeper_stop.clear()
+        _sweeper = threading.Thread(target=_sweeper_loop, name="windows-mcp-job-sweeper", daemon=True)
+        _sweeper.start()
+
+
+def stop_sweeper(timeout: float = 5.0) -> None:
+    global _sweeper
+    _sweeper_stop.set()
+    thread, _sweeper = _sweeper, None
+    if thread is not None:
+        thread.join(timeout)
 
 
 # --- server start -------------------------------------------------------------
@@ -507,7 +590,6 @@ def reconcile() -> dict[str, int]:
     now = time.time()
     me = _identity()
     highest = 0
-    claimed: set[str] = set()
 
     for meta_path in sorted(directory.glob("*.json")):
         try:
@@ -518,7 +600,6 @@ def reconcile() -> dict[str, int]:
             continue
         highest = max(highest, number)
         stem = meta_path.name[: -len(".json")]
-        claimed.update({f"{stem}.out", f"{stem}.err", meta_path.name})
         owner = (data.get("server_pid"), data.get("server_created"))
         if owner != me and _same_process_alive(*owner):
             counts["foreign_live"] += 1  # another server is running it; not ours to touch
@@ -571,15 +652,7 @@ def reconcile() -> dict[str, int]:
             **({"note": note} if note else {}),
         )
 
-    for path in directory.iterdir():
-        if path.name in claimed or not path.is_file():
-            continue
-        try:
-            if now - path.stat().st_mtime > ORPHAN_FILE_GRACE_SECONDS:
-                path.unlink()
-                counts["stray_files_removed"] += 1
-        except OSError:
-            logger.debug("Could not remove stray job file %s", path, exc_info=True)
+    counts["stray_files_removed"] = _remove_stray_files(now)
 
     with _lock:
         _next_number = max(_next_number, highest + 1)

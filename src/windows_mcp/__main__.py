@@ -242,6 +242,7 @@ def _build_mcp() -> FastMCP:
                 from windows_mcp.powershell import jobs as _jobs
 
                 logger.debug("Job reconcile at start: %s", await asyncio.to_thread(_jobs.reconcile))
+                _jobs.start_sweeper()
             except Exception:
                 logger.warning("Job reconcile at start failed", exc_info=True)
             logger.debug("Server started, entering main loop")
