@@ -54,8 +54,9 @@ Verified on 2026-09-26: a fresh clone started this way lists 21 tools, including
 | `cb96450` | `powershell/service.py` | Default `PYTHONIOENCODING=utf-8` for spawned shells, so non-ASCII text printed by Python is not garbled. |
 | `7d86103` | `powershell/jobs.py`, `tools/shell.py`, `__main__.py` | Bind every job to the server with a Windows Job Object, record each job in a metadata file, and clean up after an earlier server run at start. See [Job lifetime and cleanup](#job-lifetime-and-cleanup). |
 | `45098ab` | `powershell/jobs.py`, `__main__.py` | Sweep finished jobs and stray files on a schedule, so a server left running for days still cleans up. Retention and interval are configurable. |
+| `3768989` | `powershell/jobs.py`, `powershell/service.py`, `tools/shell.py`, `scripts/windows-mcp-jobs.ps1` (new) | Keep what a finished job left running bound to the job, even if its root process was killed from outside; add a script that reports every job record and, as a last resort, kills a verified PID. The scheduled sweep defaults to every 90 minutes. |
 
-All paths are under `src/windows_mcp/`.
+Paths are under `src/windows_mcp/`, except `scripts/`.
 
 ### Long commands: `timeout` and `PowerShellJob`
 
@@ -121,21 +122,92 @@ PowerShellJob action=list
      Status Code: 0
 ```
 
-The first and third results are from a verified run under Claude Desktop (a 302-second `ssh` command).
+The first and third results are from a verified run under Claude Desktop.
+
+#### Listing jobs
+
+```text
+PowerShellJob action=list
+```
+
+Example response (illustrative values):
+
+```text
+Response: job-1: killed (from an earlier server run), 5s, PID 77412, hard timeout 900s: & 'C:\tools\python.exe' -u 'C:\work\train.py'
+job-3: running, 412s, PID 80844, hard timeout 900s: & 'C:\tools\python.exe' -u 'C:\work\long-task.py'
+job-4: exited, exit 0, 245s, PID 81120, hard timeout 600s: ssh host 'backup.sh'
+job-5: exited, exit 0, 1 leftover process(es), 230s, PID 81502, hard timeout 600s: & '.\start-worker.ps1'
+Status Code: 0
+```
+
+Jobs are listed in the order they started. Each line is `<job id>: <state>[, exit <code>][, (from an earlier server run)][, <n> leftover process(es)], <elapsed>, PID <pid>, hard timeout <seconds>: <command>`. The PID is that of the PowerShell process that runs the command. `No jobs.` means there are none.
+
+#### If `kill` does not work (last resort)
+
+Normally `PowerShellJob action=kill job_id=<id>` is enough, and if the server itself is gone, every job's processes have already ended with it. If a job still seems to be running, or the server does not answer, use the job records directly:
+
+1. **Find the PID.** If the server answers, `PowerShellJob action=list` shows it. If not, run the report script from the clone. It reads every record (`~/.windows-mcp/jobs/*.json`) and prints all its fields, plus two live checks: `Running` is `True` only if the recorded PID still belongs to the same process (same PID *and* same start time), and `Server` says whether the owning server is still running. Add `-Tail 20` to see the last 20 lines of each job's output.
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File C:\path\to\Windows-MCP-private\scripts\windows-mcp-jobs.ps1
+   ```
+
+   ```text
+   Id              : job-3
+   Record          : 75036-job-3
+   State           : running
+   Running         : True
+   Pid             : 80844
+   PidStarted      : 2026/09/26 21:10:05
+   PidCreatedEpoch : 1790424605.123
+   ExitCode        :
+   Started         : 2026/09/26 21:10:05
+   Ended           :
+   HardTimeout     : 900
+   ServerPid       : 75036
+   Server          : running
+   JobObject       : True
+   Adopted         : False
+   Command         : & 'C:\tools\python.exe' -u 'C:\work\long-task.py'
+   Note            :
+   OutFile         : C:\Users\you\.windows-mcp\jobs\75036-job-3.out
+   OutBytes        : 1834
+   ErrFile         : C:\Users\you\.windows-mcp\jobs\75036-job-3.err
+   ErrBytes        : 0
+   RecordFile      : C:\Users\you\.windows-mcp\jobs\75036-job-3.json
+   ```
+
+   (Illustrative values; dates follow your locale.)
+
+2. **Kill it, only if `Running` is `True`.** Either let the script do it, which re-checks the PID and lists what it will kill:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File C:\path\to\Windows-MCP-private\scripts\windows-mcp-jobs.ps1 -Kill job-3
+   ```
+
+   or run taskkill yourself with the PID from step 1:
+
+   ```powershell
+   taskkill /PID 80844 /T /F
+   ```
+
+   If `Running` is `False`, do **not** use that PID: the job's process is gone, and Windows may have given the number to an unrelated process.
+
+3. **Descendants whose parent has already exited** are not reached by `taskkill /T`, which follows parent links. They stay bound to the job, so `PowerShellJob action=kill job_id=job-3` ends them. If the server does not answer, restart Claude Desktop: when the server exits, Windows ends every process in its jobs.
 
 ### Job lifetime and cleanup
 
-Every job is bound to the server process that started it. You never need to find and kill a job's processes yourself.
+Every job is bound to the server process that started it. Normally you never need to find and kill a job's processes yourself; the last-resort steps above are for when something has gone wrong.
 
 | Situation | What happens |
 |---|---|
-| The command finishes | Its output and exit code stay available to `status`, `wait` and `list`. A process the command deliberately left running (for example with `Start-Process`) keeps running, the same as with a plain call. |
+| The command finishes | Its output and exit code stay available to `status`, `wait` and `list`. If the command was handed back as a job, any process it left running stays bound to the job: `list` shows it as a leftover, `kill` ends it, and it ends when the job is deleted or the server exits. This holds however the command ended, including when its PowerShell process was killed from outside. A command that finishes within 200 s behaves exactly like a plain call instead: a process it deliberately left running (for example with `Start-Process`) keeps running. |
 | `kill`, or the hard timeout expires | CTRL_BREAK is sent. As soon as the command exits, or after 2 s if it does not, whatever is left of its process tree is ended through the Job Object, including grandchildren whose parent has already exited. |
 | The server shuts down normally | Running jobs are stopped and recorded as killed, with the reason. |
-| The server crashes or is killed | Windows closes the server's Job Object handles, which ends every running job's whole process tree immediately. No job keeps running unsupervised. (In the fallback case described below, leftovers are instead killed at the next server start.) |
+| The server crashes or is killed | Windows closes the server's Job Object handles, which immediately ends every process bound to a job, running or left over. No job keeps running unsupervised. (In the fallback case described below, leftovers are instead killed at the next server start.) |
 | The next server starts | It reads the records left by servers that are gone. A leftover process is killed only if both its PID and its creation time match the record, so a process that merely reused the PID is never touched. The job is then listed as `killed (from an earlier server run)`, with its output still readable. Jobs of another server that is still running are left alone. |
 
-How this works: each command is started suspended, placed in its own Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and only then resumed, so nothing it starts can escape the Job Object. When the command ends normally, the Job Object is released without killing. If a Job Object cannot be created, the job still runs: this is logged and recorded as `"job_object": false`, `kill` and the hard timeout fall back to `taskkill /T`, and the next server start still kills verified leftovers.
+How this works: each command is started suspended, placed in its own Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and only then resumed, so nothing it starts can escape the Job Object. Only a command that finishes within its first call has its Job Object released without killing. If a Job Object cannot be created, the job still runs: this is logged and recorded as `"job_object": false`, `kill` and the hard timeout fall back to `taskkill /T`, and the next server start still kills verified leftovers.
 
 **No depth limit.** Windows puts every process that a job's process starts into the same Job Object, at any depth, so there is no cut-off at children or grandchildren. Verified on 2026-09-26:
 
@@ -155,10 +227,29 @@ What is not covered: a program that is not a descendant of the command, because 
 **When files are deleted.**
 
 - A finished job is kept for **6 hours after it ended** (`WINDOWS_MCP_JOB_RETENTION_HOURS`). Until then it stays in `list`.
-- A sweeper thread in the server checks every **10 minutes** (`WINDOWS_MCP_JOB_SWEEP_INTERVAL`) and deletes the three files of every job past its retention. A server left running for days therefore still cleans up on schedule, even if no one touches it. Server start, any new job and any `PowerShellJob` call sweep as well.
+- A sweeper thread in the server checks every **90 minutes** (`WINDOWS_MCP_JOB_SWEEP_INTERVAL`) and deletes the three files of every job past its retention. A server left running for days therefore still cleans up on schedule, even if no one touches it. Server start, any new job and any `PowerShellJob` call sweep as well. Deleting a job also ends any leftover process still bound to it.
 - A job that finishes within the first 200 s of its call is deleted right away, because its output was already returned.
 - Files that no job record claims (for example output left by older versions of this fork) are deleted by the same sweep once they are older than 10 minutes.
 - Job numbers continue across restarts, so an id is never reused while an older job with it is still on disk.
+
+**Changing the cleanup settings.** Add an `env` block to the server's entry in `claude_desktop_config.json`. Values are strings; the interval is in seconds and the retention in hours:
+
+```json
+{
+  "mcpServers": {
+    "windows-mcp": {
+      "command": "uv",
+      "args": ["--directory", "C:\\path\\to\\Windows-MCP-private", "run", "windows-mcp", "serve"],
+      "env": {
+        "WINDOWS_MCP_JOB_SWEEP_INTERVAL": "600",
+        "WINDOWS_MCP_JOB_RETENTION_HOURS": "24"
+      }
+    }
+  }
+}
+```
+
+This example sweeps every 10 minutes and keeps finished jobs for 24 hours. The server reads its environment only when it starts, so **restart Claude Desktop completely** (tray icon and any Claude processes in Task Manager included) for the change to take effect. Remove the lines to go back to the defaults (90 minutes, 6 hours).
 
 ### Tool call log
 
@@ -201,7 +292,7 @@ A call the host abandoned (illustrative values, in the format the server writes)
 | `WINDOWS_MCP_JOB_RETURN_AFTER` | `200` | Seconds a call waits before handing a command over as a job (capped at 225) |
 | `WINDOWS_MCP_JOB_DIR` | `~/.windows-mcp/jobs` | Where job output and records are written |
 | `WINDOWS_MCP_JOB_RETENTION_HOURS` | `6` | How long a finished job is kept |
-| `WINDOWS_MCP_JOB_SWEEP_INTERVAL` | `600` | Seconds between scheduled sweeps |
+| `WINDOWS_MCP_JOB_SWEEP_INTERVAL` | `5400` | Seconds between scheduled sweeps (90 minutes) |
 | `WINDOWS_MCP_CALLLOG` | `~/.windows-mcp/calls.log` | Call log path, or `off` to disable it |
 | `WINDOWS_MCP_CALLLOG_MAX_BYTES` | `1000000` | Rotation threshold in bytes |
 | `WINDOWS_MCP_CALLLOG_BACKUPS` | `3` | Older generations to keep |
@@ -211,7 +302,7 @@ A call the host abandoned (illustrative values, in the format the server writes)
 ### Notes
 
 - PowerShell reports a failing native command as exit code 1. Append `; exit $LASTEXITCODE` to pass the original code on. This is unchanged upstream behaviour.
-- Tests: 557 passed, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py`, `tests/test_job_lifecycle.py` and `tests/test_python_io_encoding.py`.
+- Tests: 561 passed, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py`, `tests/test_job_lifecycle.py` and `tests/test_python_io_encoding.py`.
 
 ### License
 
