@@ -1,7 +1,7 @@
 > [!NOTE]
-> **This is a fork of [CursorTouch/Windows-MCP](https://github.com/CursorTouch/Windows-MCP)**, based on upstream `main` at `a868ed6` (version 0.8.5) and maintained by [kino-tk](https://github.com/kino-tk).
-> It adds reliability fixes for the PowerShell tool when the server runs under an MSIX-packaged MCP host such as Claude Desktop, and background jobs for long commands.
-> The changes are intended to be offered upstream as separate pull requests. The original README follows unchanged after this section.
+> **This is a fork of [CursorTouch/Windows-MCP](https://github.com/CursorTouch/Windows-MCP)**, based on upstream `main` at `a868ed6` (version 0.8.5), submitted by [kino-tk](https://github.com/kino-tk).
+> I made these changes for my own use. The upstream PowerShell tool kept getting in my way under Claude Desktop (hanging calls, failing `ssh`, commands cut off after four minutes), so I changed it to work the way I wanted. They are published as they are.
+> The original README follows unchanged after this section.
 
 ## About this fork
 
@@ -39,7 +39,7 @@ The upstream instructions further down (`uvx windows-mcp`, PyPI, the Claude Desk
 
    If Claude Desktop cannot find `uv`, give its full path in `command` (run `where uv` to see it).
 
-3. **Restart Claude Desktop** to load the server. Quit it completely, including the tray icon and any Claude processes left in Task Manager, then start it again. The same applies after every `git pull`: the running server keeps the old code until the restart.
+3. **Restart Claude Desktop** to load the server. Quit it completely, including the tray icon and any Claude processes left in Task Manager, then start it again.
 
 Verified on 2026-09-26: a fresh clone started this way lists 21 tools, including `PowerShellJob`.
 
@@ -52,49 +52,108 @@ Verified on 2026-09-26: a fresh clone started this way lists 21 tools, including
 | `f789895` | `powershell/utils.py`, `infrastructure/calllog.py` (new), `infrastructure/analytics.py` | Bound every wait on a child process tree. `taskkill` gets a 10 s limit, and the `Popen` is no longer a context manager, because its `__exit__` ends in an unbounded `wait()`. Before: a child that ignores CTRL_BREAK held a call for 30.1 s against a 1 s timeout. Also adds the tool call log. |
 | `1574769` | `powershell/jobs.py` (new), `powershell/service.py`, `tools/shell.py` | Background jobs for long PowerShell commands, and the new `PowerShellJob` tool. |
 | `cb96450` | `powershell/service.py` | Default `PYTHONIOENCODING=utf-8` for spawned shells, so non-ASCII text printed by Python is not garbled. |
+| `7d86103` | `powershell/jobs.py`, `tools/shell.py`, `__main__.py` | Bind every job to the server with a Windows Job Object, record each job in a metadata file, and clean up after an earlier server run at start. See [Job lifetime and cleanup](#job-lifetime-and-cleanup). |
 
 All paths are under `src/windows_mcp/`.
 
 ### Long commands: `timeout` and `PowerShellJob`
 
-- `timeout` on the PowerShell tool is the hard limit chosen by the caller. The command is killed when it expires (default 30 s, no upper bound).
-- If `timeout` is longer than about 200 s and the command is still running at that point, the call returns early with the output so far, `Status Code: running` and a `job_id`. The command keeps running.
-- A command that finishes within 200 s returns exactly what a plain call would.
-- Calls whose `timeout` is 200 s or less take the pre-job code path (`execute_command`), which still has the bounded waits added in `f789895`.
-- Output is written to files under `~/.windows-mcp/jobs`, so it can be read while the command runs. Programs must print progressively to show partial output (for Python, use `-u`). Interactive prompts are not supported.
-- Jobs live in the server process. If the server restarts, the job list is lost but the processes keep running. Finished jobs are kept for 6 hours; files left by an earlier server process are removed after 24 hours.
-
-`PowerShellJob` arguments:
-
-| Argument | Default | Meaning |
-|---|---|---|
-| `action` | `wait` | `wait`, `status`, `kill` or `list` |
-| `job_id` | `""` | The job id returned by the PowerShell tool. Not needed for `list`. |
-| `wait_seconds` | `60` | For `wait`: how long to block, capped at about 200 s per call |
-| `tail_chars` | `4000` | While the command is still running: how much of the latest stdout and stderr to show |
-
-- `wait` returns the full output and the exit code once the command has finished; if it is still running, it returns the latest output with `Status Code: running`, and you call `wait` again.
-- `status` returns at once. `kill` stops the command and all its child processes. `list` shows every job with its state.
-
-Example (a 302-second `ssh` command, as verified under Claude Desktop):
+#### Command syntax
 
 ```text
-PowerShell(command="ssh host 'long-task.sh'", timeout=600)
+PowerShell     command=<string> [timeout=<seconds>]
+
+PowerShellJob  action=list
+PowerShellJob  action=status  job_id=<id> [tail_chars=<n>]
+PowerShellJob  [action=wait]  job_id=<id> [wait_seconds=<0-200>] [tail_chars=<n>]
+PowerShellJob  action=kill    job_id=<id>
+```
+
+- `[ ]` marks an optional argument; `<...>` is a value you supply. Anything not listed for a form is ignored.
+- MCP arguments are passed by name, so their order does not matter; the forms above show the conventional order.
+- `action=wait` is the default, so `PowerShellJob job_id=<id>` waits.
+
+| Argument | Tool | Default | Meaning |
+|---|---|---|---|
+| `command` | PowerShell | (required) | The PowerShell command line to run. |
+| `timeout` | PowerShell | `30` | Hard limit in seconds; the command is killed when it expires. No upper bound. |
+| `action` | PowerShellJob | `wait` | `wait`, `status`, `kill` or `list`. |
+| `job_id` | PowerShellJob | (required except for `list`) | The id returned by PowerShell, for example `job-1`. |
+| `wait_seconds` | PowerShellJob | `60` | For `wait`: how long to block. Capped at about 200 s per call. |
+| `tail_chars` | PowerShellJob | `4000` | While the command is still running: how many of the latest characters of stdout and of stderr to show. A finished job always shows its full output. |
+
+#### How it behaves
+
+- If `timeout` is longer than about 200 s and the command is still running at that point, the PowerShell call returns early with the output so far, `Status Code: running` and a job id. The command keeps running.
+- A command that finishes within 200 s returns exactly what a plain call would.
+- Calls whose `timeout` is 200 s or less take the pre-job code path (`execute_command`), which still has the bounded waits added in `f789895`.
+- `wait` returns the full output and the exit code once the command has finished. If it is still running, `wait` returns the latest output with `Status Code: running`; call it again.
+- `status` returns at once. `kill` stops the command and every process it started. `list` shows every job with its state.
+- Output is written to files, so it can be read while the command runs. Programs must print progressively to show partial output (for Python, use `-u`). Interactive prompts are not supported.
+
+#### Examples
+
+```text
+PowerShell    command="ssh host 'long-task.sh'" timeout=600
   -> Still running after 200s (waited 200s in this call). The command continues in the
      background as job-1 (PID 4196); it is stopped at its hard timeout of 600s ...
-     --- output so far ---
+     --- output so far (last 4000 chars of each stream) ---
      ...
      Status Code: running
 
-PowerShellJob(action="wait", job_id="job-1", wait_seconds=200)
+PowerShellJob action=status job_id=job-1 tail_chars=500
+  -> Still running after 245s ... (only the last 500 characters of output)
+     Status Code: running
+
+PowerShellJob job_id=job-1 wait_seconds=200
   -> job-1 finished: exited, exit 0, after 302s.
      <full output>
      Status Code: 0
+
+PowerShellJob action=kill job_id=job-2
+  -> job-2 finished: killed, exit 1, after 40s. ...
+     Status Code: 1
+
+PowerShellJob action=list
+  -> job-1: exited, exit 0, 302s, PID 4196, hard timeout 600s: ssh host 'long-task.sh'
+     job-2: killed, exit 1, 40s, PID 5120, hard timeout 900s: ...
+     Status Code: 0
 ```
+
+The first and third results are from a verified run under Claude Desktop (a 302-second `ssh` command).
+
+### Job lifetime and cleanup
+
+Every job is bound to the server process that started it. You never need to find and kill a job's processes yourself.
+
+| Situation | What happens |
+|---|---|
+| The command finishes | Its output and exit code stay available to `status`, `wait` and `list`. A process the command deliberately left running (for example with `Start-Process`) keeps running, the same as with a plain call. |
+| `kill`, or the hard timeout expires | CTRL_BREAK is sent. As soon as the command exits, or after 2 s if it does not, whatever is left of its process tree is ended through the Job Object, including grandchildren whose parent has already exited. |
+| The server shuts down normally | Running jobs are stopped and recorded as killed, with the reason. |
+| The server crashes or is killed | Windows closes the server's Job Object handles, which ends every running job's whole process tree immediately. No job keeps running unsupervised. (In the fallback case described below, leftovers are instead killed at the next server start.) |
+| The next server starts | It reads the records left by servers that are gone. A leftover process is killed only if both its PID and its creation time match the record, so a process that merely reused the PID is never touched. The job is then listed as `killed (from an earlier server run)`, with its output still readable. Jobs of another server that is still running are left alone. |
+
+How this works: each command is started suspended, placed in its own Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and only then resumed, so nothing it starts can escape the Job Object. When the command ends normally, the Job Object is released without killing. If a Job Object cannot be created, the job still runs: this is logged and recorded as `"job_object": false`, `kill` and the hard timeout fall back to `taskkill /T`, and the next server start still kills verified leftovers.
+
+**Files.** Each job keeps three files in `~/.windows-mcp/jobs`, named `<server PID>-<job id>`:
+
+| File | Content |
+|---|---|
+| `.out` | stdout |
+| `.err` | stderr |
+| `.json` | The job's record: id, PID and its creation time, the first 200 characters of the command, hard timeout, state, exit code, start and end times, note, and the server that owns it. It is rewritten atomically whenever the state changes. |
+
+**When files are deleted.**
+
+- A finished job is kept for **6 hours after it ended**. After that its three files are deleted at the next cleanup point: server start, any new job, or any `PowerShellJob` call. Until then it stays in `list`.
+- A job that finishes within the first 200 s of its call is deleted right away, because its output was already returned.
+- Output files without a record (left by older versions of this fork) are deleted at server start once they are older than 10 minutes.
+- Job numbers continue across restarts, so an id is never reused while an older job with it is still on disk.
 
 ### Tool call log
 
-Every tool call writes a `start` and an `end` record to `~/.windows-mcp/calls.log` as JSON lines, plus a `cancelled` record if the host gives up first. Commands that become jobs also get `job_start` and `job_end` records.
+Every tool call writes a `start` and an `end` record to `~/.windows-mcp/calls.log` as JSON lines, plus a `cancelled` record if the host gives up first. Jobs add `job_start` and `job_end` records, and `job_adopted` when a new server takes over the record of a job from an earlier run.
 
 - `id` is `<server PID>-<sequence>` and pairs a call's `start`, `cancelled` and `end`. Job records use the job id.
 - `tool` is the server's internal label (for example `Powershell-Tool`), not the MCP tool name.
@@ -103,13 +162,19 @@ Every tool call writes a `start` and an `end` record to `~/.windows-mcp/calls.lo
 - Commands are truncated to 200 characters. Free-text arguments (`content`, `text`, `value`, `data`, `input`) are logged by length only.
 - The file rotates at 1 MB and keeps 3 older generations, about 4 MB in total.
 
-A call that became a job (real records; only the command is replaced):
+A call that became a job (from a verified run; the command is replaced, and `job_start` also shows the `job_object` field that the current version adds):
 
 ```json
 {"ts": "2026-09-26T09:21:06.411+09:00", "event": "start", "id": "9696-1", "tool": "Powershell-Tool", "args": {"command": "ssh host 'long-task.sh'", "timeout": 600}, "client": "claude-ai"}
-{"ts": "2026-09-26T09:21:06.447+09:00", "event": "job_start", "id": "job-1", "tool": "PowerShell", "pid": 4196, "hard_timeout": 600.0, "command": "ssh host 'long-task.sh'"}
+{"ts": "2026-09-26T09:21:06.447+09:00", "event": "job_start", "id": "job-1", "tool": "PowerShell", "pid": 4196, "hard_timeout": 600.0, "job_object": true, "command": "ssh host 'long-task.sh'"}
 {"ts": "2026-09-26T09:24:26.471+09:00", "event": "end", "id": "9696-1", "tool": "Powershell-Tool", "status": "ok", "duration_ms": 200059, "result_chars": 788, "exit": "running"}
 {"ts": "2026-09-26T09:26:07.956+09:00", "event": "job_end", "id": "job-1", "tool": "PowerShell", "state": "exited", "returncode": 0, "duration_ms": 301509}
+```
+
+A job whose server was killed, taken over by the next server (real record):
+
+```json
+{"ts": "2026-09-26T18:56:47.000+09:00", "event": "job_adopted", "id": "job-1", "tool": "PowerShell", "state": "killed", "previous_server_pid": 75036, "note": "Its Windows-MCP server exited while it was running; the job was ended together with the server."}
 ```
 
 A call the host abandoned (illustrative values, in the format the server writes):
@@ -125,7 +190,7 @@ A call the host abandoned (illustrative values, in the format the server writes)
 | Variable | Default | Meaning |
 |---|---|---|
 | `WINDOWS_MCP_JOB_RETURN_AFTER` | `200` | Seconds a call waits before handing a command over as a job (capped at 225) |
-| `WINDOWS_MCP_JOB_DIR` | `~/.windows-mcp/jobs` | Where job output files are written |
+| `WINDOWS_MCP_JOB_DIR` | `~/.windows-mcp/jobs` | Where job output and records are written |
 | `WINDOWS_MCP_CALLLOG` | `~/.windows-mcp/calls.log` | Call log path, or `off` to disable it |
 | `WINDOWS_MCP_CALLLOG_MAX_BYTES` | `1000000` | Rotation threshold in bytes |
 | `WINDOWS_MCP_CALLLOG_BACKUPS` | `3` | Older generations to keep |
@@ -135,7 +200,7 @@ A call the host abandoned (illustrative values, in the format the server writes)
 ### Notes
 
 - PowerShell reports a failing native command as exit code 1. Append `; exit $LASTEXITCODE` to pass the original code on. This is unchanged upstream behaviour.
-- Tests: 542 passed, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py` and `tests/test_python_io_encoding.py`.
+- Tests: 553 passed, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py`, `tests/test_job_lifecycle.py` and `tests/test_python_io_encoding.py`.
 
 ### License
 
