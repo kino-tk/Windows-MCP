@@ -59,17 +59,61 @@ def read_file(path: str, offset: int | None = None, limit: int | None = None, en
         return f'Error reading file: {e}'
 
 
-def write_file(path: str, content: str, append: bool = False, encoding: str = 'utf-8', create_parents: bool = True) -> str:
-    """Write or append text content to a file."""
+LINE_ENDINGS = ('keep', 'lf', 'crlf')
+
+
+def resolve_line_ending(value: str | None = None) -> str:
+    """The line-ending mode to use: *value*, else WINDOWS_MCP_WRITE_LINE_ENDING, else 'keep'.
+
+    An invalid explicit *value* raises ValueError; an invalid environment value
+    falls back to 'keep' so a typo there cannot break every write.
+    """
+    if value is not None and str(value).strip():
+        mode = str(value).strip().lower()
+        if mode not in LINE_ENDINGS:
+            raise ValueError(f"line_ending must be one of {', '.join(LINE_ENDINGS)}, got {value!r}")
+        return mode
+    env = os.environ.get('WINDOWS_MCP_WRITE_LINE_ENDING', '').strip().lower()
+    return env if env in LINE_ENDINGS else 'keep'
+
+
+def _apply_line_ending(content: str, mode: str) -> str:
+    if mode == 'lf':
+        return content.replace('\r\n', '\n')
+    if mode == 'crlf':
+        return content.replace('\r\n', '\n').replace('\n', '\r\n')
+    return content
+
+
+def write_file(
+    path: str,
+    content: str,
+    append: bool = False,
+    encoding: str = 'utf-8',
+    create_parents: bool = True,
+    line_ending: str | None = None,
+) -> str:
+    """Write or append text content to a file.
+
+    Line endings are written exactly as *line_ending* says: 'keep' writes the
+    content as given (so "\\n" stays LF), 'lf' and 'crlf' normalise every line
+    break. The default comes from WINDOWS_MCP_WRITE_LINE_ENDING, else 'keep'.
+    Python's text-mode translation of "\\n" to "\\r\\n" on Windows is disabled.
+    """
     file_path = Path(path).resolve()
+
+    try:
+        mode_name = resolve_line_ending(line_ending)
+    except ValueError as e:
+        return f'Error: {e}'
 
     try:
         if create_parents:
             file_path.parent.mkdir(parents=True, exist_ok=True)
 
         mode = 'a' if append else 'w'
-        with open(file_path, mode, encoding=encoding) as f:
-            f.write(content)
+        with open(file_path, mode, encoding=encoding, newline='') as f:
+            f.write(_apply_line_ending(content, mode_name))
 
         action = 'Appended to' if append else 'Written to'
         size = file_path.stat().st_size

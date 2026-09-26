@@ -12,7 +12,7 @@ from fastmcp import Context
 def register(mcp, *, get_desktop, get_analytics):
     @mcp.tool(
         name='FileSystem',
-        description="Manages file system operations with eight modes: 'read' (read text file contents with optional line offset/limit), 'write' (create or overwrite a file, set append=True to append), 'copy' (copy file or directory to destination), 'move' (move or rename file/directory), 'delete' (delete file or directory, set recursive=True for non-empty dirs), 'list' (list directory contents with optional pattern filter), 'search' (find files matching a glob pattern), 'info' (get file/directory metadata like size, dates, type). Relative paths are resolved from the user's Desktop folder. Use absolute paths to access other locations.",
+        description="Manages file system operations with eight modes: 'read' (read text file contents with optional line offset/limit), 'write' (create or overwrite a file, set append=True to append; line_ending='keep' writes the content as given, so \\n stays LF, 'lf' or 'crlf' normalises every line break, default from WINDOWS_MCP_WRITE_LINE_ENDING, else 'keep'), 'copy' (copy file or directory to destination), 'move' (move or rename file/directory), 'delete' (delete file or directory, set recursive=True for non-empty dirs), 'list' (list directory contents with optional pattern filter), 'search' (find files matching a glob pattern), 'info' (get file/directory metadata like size, dates, type). Relative paths are resolved from the user's Desktop folder. Use absolute paths to access other locations.",
         annotations=ToolAnnotations(
             title="FileSystem",
             readOnlyHint=False,
@@ -31,6 +31,7 @@ def register(mcp, *, get_desktop, get_analytics):
         recursive: bool | str = False,
         append: bool | str = False,
         overwrite: bool | str = False,
+        line_ending: Literal['keep', 'lf', 'crlf'] | None = None,
         offset: int | None = None,
         limit: int | None = None,
         encoding: str = 'utf-8',
@@ -56,7 +57,7 @@ def register(mcp, *, get_desktop, get_analytics):
                 case 'write':
                     if content is None:
                         return 'Error: content parameter is required for write mode.'
-                    return filesystem.write_file(path, content, append=append, encoding=encoding)
+                    return filesystem.write_file(path, content, append=append, encoding=encoding, line_ending=line_ending)
                 case 'copy':
                     if destination is None:
                         return 'Error: destination parameter is required for copy mode.'
