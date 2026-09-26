@@ -1,18 +1,20 @@
 > [!NOTE]
-> **This is a fork of [CursorTouch/Windows-MCP](https://github.com/CursorTouch/Windows-MCP)**, based on upstream `main` at `a868ed6` (version 0.8.5), submitted by [kino-tk](https://github.com/kino-tk).
-> I made these changes for my own use. The upstream PowerShell tool kept getting in my way under Claude Desktop (hanging calls, failing `ssh`, commands cut off after four minutes), so I changed it to work the way I wanted. They are published as they are.
+> **This is a fork of [CursorTouch/Windows-MCP](https://github.com/CursorTouch/Windows-MCP)**, based on upstream `main` at `a868ed6` (version 0.8.5), made by [kino-tk](https://github.com/kino-tk).
+> I made these changes for my own use. Windows-MCP kept getting in my way under Claude Desktop (hanging calls, failing `ssh`, commands cut off after four minutes, garbled Japanese, CRLF line endings), so I changed it to work the way I wanted. They are published as they are.
 > The original README follows unchanged after this section.
 
 ## About this fork
 
 ### Why
 
-Under Claude Desktop, an MSIX-packaged host, the PowerShell tool had four practical problems:
+Under Claude Desktop, an MSIX-packaged host, Windows-MCP had these practical problems for me:
 
 1. **Calls hung after the command had finished.** A detached grandchild inherited the capture pipes, so the reader never saw EOF.
 2. **`ssh`, `scp` and `sftp` failed with exit code 255 and no output.** The packaged host hands down an environment block without `ProgramData` and the other known-folder variables, and Win32 OpenSSH aborts before it even parses its arguments.
 3. **Anything longer than about four minutes was cut off.** The host abandons a tool call after 240 s, and a server cannot extend that.
 4. **When a call did hang, nothing showed which tool or command it was.** The host's log records only that a `tools/call` was sent.
+5. **Japanese text printed by Python came back garbled.** With its output captured, Python writes in the Windows code page (cp932 here), while the server reads the output as UTF-8.
+6. **Files written by the FileSystem tool always had CRLF line endings.** I move files back and forth between Linux and Windows, and because the two use different line endings I had to check them every time, which was tedious. I wanted files that I bring down to Windows to keep LF line endings, so I added a way to choose them.
 
 ### Installation
 
@@ -56,6 +58,7 @@ Verified on 2026-09-26: a fresh clone started this way lists 21 tools, including
 | `45098ab` | `powershell/jobs.py`, `__main__.py` | Sweep finished jobs and stray files on a schedule, so a server left running for days still cleans up. Retention and interval are configurable. |
 | `3768989` | `powershell/jobs.py`, `powershell/service.py`, `tools/shell.py`, `scripts/windows-mcp-jobs.ps1` (new) | Keep what a finished job left running bound to the job, even if its root process was killed from outside; add a script that reports every job record and, as a last resort, kills a verified PID. The scheduled sweep defaults to every 90 minutes. |
 | `3ff68c0` | `filesystem/service.py`, `tools/filesystem.py` | FileSystem `write` no longer turns every `\n` into `\r\n`; a new `line_ending` argument chooses `keep`, `lf` or `crlf`. See [Line endings in FileSystem write](#line-endings-in-filesystem-write). |
+| `dc967cc` | `powershell/jobs.py`, `scripts/windows-mcp-jobs.ps1` | Job cleanup only ever reads or deletes files named like job files, so other files in the job directory are safe. |
 
 Paths are under `src/windows_mcp/`, except `scripts/`.
 
@@ -68,7 +71,7 @@ PowerShell     command=<string> [timeout=<seconds>]
 
 PowerShellJob  action=list
 PowerShellJob  action=status  job_id=<id> [tail_chars=<n>]
-PowerShellJob  [action=wait]  job_id=<id> [wait_seconds=<0-200>] [tail_chars=<n>]
+PowerShellJob  [action=wait]  job_id=<id> [wait_seconds=<seconds>] [tail_chars=<n>]
 PowerShellJob  action=kill    job_id=<id>
 ```
 
@@ -82,7 +85,7 @@ PowerShellJob  action=kill    job_id=<id>
 | `timeout` | PowerShell | `30` | Hard limit in seconds; the command is killed when it expires. No upper bound. |
 | `action` | PowerShellJob | `wait` | `wait`, `status`, `kill` or `list`. |
 | `job_id` | PowerShellJob | (required except for `list`) | The id returned by PowerShell, for example `job-1`. |
-| `wait_seconds` | PowerShellJob | `60` | For `wait`: how long to block. Capped at about 200 s per call. |
+| `wait_seconds` | PowerShellJob | `60` | For `wait`: how long to block. Capped per call at `WINDOWS_MCP_JOB_RETURN_AFTER` seconds (200 by default, at most 225). |
 | `tail_chars` | PowerShellJob | `4000` | While the command is still running: how many of the latest characters of stdout and of stderr to show. A finished job always shows its full output. |
 
 #### How it behaves
@@ -95,6 +98,8 @@ PowerShellJob  action=kill    job_id=<id>
 - Output is written to files, so it can be read while the command runs. Programs must print progressively to show partial output (for Python, use `-u`). Interactive prompts are not supported.
 
 #### Examples
+
+Results are shown without the `Response: ` prefix that the tool puts before the first line.
 
 ```text
 PowerShell    command="ssh host 'long-task.sh'" timeout=600
@@ -134,7 +139,7 @@ PowerShellJob action=list
 Example response (illustrative values):
 
 ```text
-Response: job-1: killed (from an earlier server run), 5s, PID 77412, hard timeout 900s: & 'C:\tools\python.exe' -u 'C:\work\train.py'
+job-1: killed (from an earlier server run), 5s, PID 77412, hard timeout 900s: & 'C:\tools\python.exe' -u 'C:\work\train.py'
 job-3: running, 412s, PID 80844, hard timeout 900s: & 'C:\tools\python.exe' -u 'C:\work\long-task.py'
 job-4: exited, exit 0, 245s, PID 81120, hard timeout 600s: ssh host 'backup.sh'
 job-5: exited, exit 0, 1 leftover process(es), 230s, PID 81502, hard timeout 600s: & '.\start-worker.ps1'
@@ -145,7 +150,7 @@ Jobs are listed in the order they started. Each line is `<job id>: <state>[, exi
 
 #### If `kill` does not work (last resort)
 
-Normally `PowerShellJob action=kill job_id=<id>` is enough, and if the server itself is gone, every job's processes have already ended with it. If a job still seems to be running, or the server does not answer, use the job records directly:
+Normally `PowerShellJob action=kill job_id=<id>` is enough, and if the server itself is gone, every job's processes have already ended with it (the one exception is a job recorded with `"job_object": false`, see the fallback under [Job lifetime and cleanup](#job-lifetime-and-cleanup); its leftovers live until the next server start, which kills them after checking PID and start time). If a job still seems to be running, or the server does not answer, use the job records directly:
 
 1. **Find the PID.** If the server answers, `PowerShellJob action=list` shows it. If not, run the report script from the clone. It reads every record (`~/.windows-mcp/jobs/*.json`) and prints all its fields, plus two live checks: `Running` is `True` only if the recorded PID still belongs to the same process (same PID *and* same start time), and `Server` says whether the owning server is still running. Add `-Tail 20` to see the last 20 lines of each job's output.
 
@@ -194,7 +199,7 @@ Normally `PowerShellJob action=kill job_id=<id>` is enough, and if the server it
 
    If `Running` is `False`, do **not** use that PID: the job's process is gone, and Windows may have given the number to an unrelated process.
 
-3. **Descendants whose parent has already exited** are not reached by `taskkill /T`, which follows parent links. They stay bound to the job, so `PowerShellJob action=kill job_id=job-3` ends them. If the server does not answer, restart Claude Desktop: when the server exits, Windows ends every process in its jobs.
+3. **Descendants whose parent has already exited** are not reached by `taskkill /T`, which follows parent links. They stay bound to the job, so `PowerShellJob action=kill job_id=job-3` ends them. If the server does not answer, restart Claude Desktop: when the server exits, Windows ends every process in its jobs. (For a job recorded with `"job_object": false`, the next server start does this instead, after checking PID and start time.)
 
 ### Job lifetime and cleanup
 
@@ -217,7 +222,7 @@ How this works: each command is started suspended, placed in its own Windows Job
 
 What is not covered: a program that is not a descendant of the command, because Windows starts it on behalf of another process. Examples are a program launched through a Windows service, Task Scheduler, WMI (`Win32_Process.Create`), an out-of-process COM server, or with elevation (UAC). Such a program is outside the Job Object, just as it is outside the command's process tree. (This follows from how Windows creates those processes; it was not tested here.)
 
-**Files.** Each job keeps three files in `~/.windows-mcp/jobs`, named `<server PID>-<job id>`:
+**Files.** Each job keeps three files in `~/.windows-mcp/jobs`, named `<server PID>-<job id>`. Only files named exactly like this (`<digits>-job-<digits>.out`, `.err`, `.json`, and a leftover `.json.tmp`) are ever read or deleted, so other files in the directory are never touched. Still, if you set `WINDOWS_MCP_JOB_DIR`, point it at a folder of its own.
 
 | File | Content |
 |---|---|
@@ -227,10 +232,10 @@ What is not covered: a program that is not a descendant of the command, because 
 
 **When files are deleted.**
 
-- A finished job is kept for **6 hours after it ended** (`WINDOWS_MCP_JOB_RETENTION_HOURS`). Until then it stays in `list`.
+- A finished job is kept for **at least 6 hours after it ended** (`WINDOWS_MCP_JOB_RETENTION_HOURS`), and deleted at the first sweep after that. With the default settings it therefore disappears between 6 and 7.5 hours after it ended. Until then it stays in `list`.
 - A sweeper thread in the server checks every **90 minutes** (`WINDOWS_MCP_JOB_SWEEP_INTERVAL`) and deletes the three files of every job past its retention. A server left running for days therefore still cleans up on schedule, even if no one touches it. Server start, any new job and any `PowerShellJob` call sweep as well. Deleting a job also ends any leftover process still bound to it.
 - A job that finishes within the first 200 s of its call is deleted right away, because its output was already returned.
-- Files that no job record claims (for example output left by older versions of this fork) are deleted by the same sweep once they are older than 10 minutes.
+- Job files that no record claims (for example output left by older versions of this fork) are deleted by the same sweep once they are older than 10 minutes. Only names of the job-file form are considered.
 - Job numbers continue across restarts, so an id is never reused while an older job with it is still on disk.
 
 **Changing the cleanup settings.** Add an `env` block to the server's entry in `claude_desktop_config.json`. Values are strings; the interval is in seconds and the retention in hours:
@@ -317,7 +322,7 @@ A call the host abandoned (illustrative values, in the format the server writes)
 | Variable | Default | Meaning |
 |---|---|---|
 | `WINDOWS_MCP_JOB_RETURN_AFTER` | `200` | Seconds a call waits before handing a command over as a job (capped at 225) |
-| `WINDOWS_MCP_JOB_DIR` | `~/.windows-mcp/jobs` | Where job output and records are written |
+| `WINDOWS_MCP_JOB_DIR` | `~/.windows-mcp/jobs` | Where job output and records are written. Use a folder of its own. |
 | `WINDOWS_MCP_JOB_RETENTION_HOURS` | `6` | How long a finished job is kept |
 | `WINDOWS_MCP_JOB_SWEEP_INTERVAL` | `5400` | Seconds between scheduled sweeps (90 minutes) |
 | `WINDOWS_MCP_CALLLOG` | `~/.windows-mcp/calls.log` | Call log path, or `off` to disable it |
@@ -331,7 +336,7 @@ A call the host abandoned (illustrative values, in the format the server writes)
 
 - PowerShell reports a failing native command as exit code 1. Append `; exit $LASTEXITCODE` to pass the original code on. This is unchanged upstream behaviour.
 - Text output is UTF-8 end to end for PowerShell itself and for the programs checked on 2026-09-26 (`cmd`, `dir`, `where`, `findstr`, git, node, and Python with the default above). The exception is older tools that read text piped into them in the system's ANSI code page, such as `sort.exe` on a Japanese system; setting `[Console]::InputEncoding` does not change that. Use the PowerShell equivalent (`Sort-Object`) instead.
-- Tests: 571 passed, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py`, `tests/test_job_lifecycle.py`, `tests/test_python_io_encoding.py` and `tests/test_line_endings.py`.
+- Tests: 572 passed, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py`, `tests/test_job_lifecycle.py`, `tests/test_python_io_encoding.py` and `tests/test_line_endings.py`.
 
 ### License
 
