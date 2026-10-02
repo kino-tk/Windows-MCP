@@ -438,7 +438,9 @@ def _watch(job: Job) -> None:
 
 def _finish(job: Job, state: str) -> None:
     with _lock:
-        if job.done.is_set():
+        # ``ended`` is claimed under the lock, so only the first caller goes on.
+        # ``done`` cannot serve as the guard: it is set last, after the record.
+        if job.ended is not None:
             return
         job.returncode = job.process.poll() if job.process is not None else None
         job.ended = time.time()
@@ -451,7 +453,8 @@ def _finish(job: Job, state: str) -> None:
     # (A job that finished within its first call is released by the caller,
     # which then behaves exactly like a plain call.)
     _write_meta(job)
-    job.done.set()
+    # Record before signalling: whoever waits on ``done`` may read the call log
+    # at once, and on a slow machine it would otherwise see job_start alone.
     calllog.record(
         "job_end",
         job.id,
@@ -461,6 +464,7 @@ def _finish(job: Job, state: str) -> None:
         duration_ms=int(job.elapsed() * 1000),
         **({"note": job.note} if job.note else {}),
     )
+    job.done.set()
 
 
 def get(job_id: str) -> Job | None:

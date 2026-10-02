@@ -141,6 +141,53 @@ def test_job_start_and_end_are_logged(job_env):
     assert mine[1]["state"] == "exited" and mine[1]["returncode"] == 0
 
 
+def test_job_end_is_logged_before_done_is_signalled(job_env, monkeypatch):
+    # A caller woken by ``done`` may read the log at once; job_end must be there.
+    seen = []
+    real = jobs.calllog.record
+
+    def spy(event, call_id, *args, **kwargs):
+        if event == "job_end":
+            seen.append(jobs.get(call_id).done.is_set())
+        return real(event, call_id, *args, **kwargs)
+
+    monkeypatch.setattr(jobs.calllog, "record", spy)
+    cmd = _py("import time; time.sleep(3)")
+    _, _, job_id = PowerShellExecutor.run(cmd, timeout=600)
+    assert jobs.get(job_id).done.wait(15)
+    assert seen == [False]
+
+
+def test_finish_twice_records_one_job_end(job_env, monkeypatch):
+    import json
+    import threading
+
+    # A second caller (kill() racing the watcher) arrives while the first is
+    # still between claiming the job and setting ``done``; it must do nothing.
+    real = jobs.calllog.record
+    second = []
+
+    def spy(event, call_id, *args, **kwargs):
+        if event == "job_end" and not second:
+            t = threading.Thread(target=jobs._finish, args=(jobs.get(call_id), "killed"))
+            second.append(t)
+            t.start()
+            t.join(5)
+        return real(event, call_id, *args, **kwargs)
+
+    monkeypatch.setattr(jobs.calllog, "record", spy)
+    cmd = _py("import time; time.sleep(3)")
+    _, _, job_id = PowerShellExecutor.run(cmd, timeout=600)
+    job = jobs.get(job_id)
+    assert job.done.wait(15)
+    jobs._finish(job, "killed")  # a late caller must change nothing either
+    assert second and not second[0].is_alive()
+    assert job.state == "exited"
+    log = job_env.parent / "calls.log"
+    recs = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [r["event"] for r in recs if r["id"] == job_id] == ["job_start", "job_end"]
+
+
 def _text(result) -> str:
     return result.content[0].text
 
