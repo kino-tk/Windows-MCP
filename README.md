@@ -59,6 +59,11 @@ Verified on 2026-09-26: a fresh clone started this way lists 21 tools, including
 | `3768989` | `powershell/jobs.py`, `powershell/service.py`, `tools/shell.py`, `scripts/windows-mcp-jobs.ps1` (new) | Keep what a finished job left running bound to the job, even if its root process was killed from outside; add a script that reports every job record and, as a last resort, kills a verified PID. The scheduled sweep defaults to every 90 minutes. |
 | `3ff68c0` | `filesystem/service.py`, `tools/filesystem.py` | FileSystem `write` no longer turns every `\n` into `\r\n`; a new `line_ending` argument chooses `keep`, `lf` or `crlf`. See [Line endings in FileSystem write](#line-endings-in-filesystem-write). |
 | `dc967cc` | `powershell/jobs.py`, `scripts/windows-mcp-jobs.ps1` | Job cleanup only ever reads or deletes files named like job files, so other files in the job directory are safe. |
+| `373e9ba` | `powershell/jobs.py` | Write the `job_end` record before signalling that a job is done, so a reader woken by the signal always finds it. |
+| `db25859` | `powershell/utils.py` | Honour `text=True` when output is captured into files (it returned bytes). |
+| `bed5411` | `powershell/service.py` | Do not add a known-folder variable again under a different letter case. |
+| `bde57ad` | `powershell/newline.py` (new), `powershell/lf_encoding.cs` (new), `powershell/service.py`, `pyproject.toml` | Choose LF or CRLF for text PowerShell writes, and stop writing a BOM to native stdin. See [Line endings and BOM in PowerShell](#line-endings-and-bom-in-powershell). |
+| `af369ed` | `powershell/newline.py` | This fork writes LF by default. |
 
 Paths are under `src/windows_mcp/`, except `scripts/`.
 
@@ -283,6 +288,46 @@ To change the default for every write, set `WINDOWS_MCP_WRITE_LINE_ENDING` in th
 
 An explicit `line_ending` argument always wins over the default. An unknown value in the environment variable is ignored (the default stays `keep`); an unknown argument value is reported as an error and nothing is written.
 
+### Line endings and BOM in PowerShell
+
+Upstream, every command run by the `PowerShell` tool starts with `$OutputEncoding = [System.Text.Encoding]::UTF8`. That encoding has a BOM, so pwsh puts `EF BB BF` in front of every stdin it feeds to a native command, and pwsh ends every line it writes with CRLF. Text sent through `ssh` to a Linux shell arrived with a stray BOM and CRs.
+
+In this fork PowerShell writes **UTF-8 without a BOM and LF** by default. The mode is set by `WINDOWS_MCP_POWERSHELL_NEWLINE` in the `env` block of the server's entry in `claude_desktop_config.json`:
+
+| Value | Effect |
+|---|---|
+| `lf` (default in this fork) | LF on every path PowerShell encodes itself (table below). |
+| `native` | CRLF as upstream. Native stdin still has no BOM. |
+
+What reaches the file or the other program, measured on 2026-10-02 with pwsh 7.6.6 (no path writes a BOM unless asked for one):
+
+| Path | Example | `lf` | `native` |
+|---|---|---|---|
+| Pipeline input to a native command | `$text \| ssh host 'cat > f'`, `@('a','b') \| python ...` | LF | CRLF |
+| Text that already contains CRLF, piped to a native command | `` "a`r`nb" \| ssh ... `` | LF | CRLF |
+| A lone CR (not followed by LF) | `` "a`rb" \| ... `` | kept | kept |
+| File-writing cmdlets and redirection of PowerShell output | `Set-Content`, `Add-Content`, `Out-File`, `>`, `>>`, `Tee-Object`, `Export-Csv` | LF | CRLF |
+| Text that already contains CRLF, written by a cmdlet | `` Set-Content f -Value "a`r`nb" `` | LF | CRLF |
+| Native output piped through a cmdlet | `cmd /c ... \| Set-Content f`, `$x = native; $x \| Set-Content f` | LF | CRLF |
+| Native output redirected to a file | `cmd /c ... > f`, `python ... > f` | as the program wrote it (CRLF for `cmd` and Python, LF for git) | same |
+| Native output piped to another native command | `cmd /c ... \| ssh ...`, `python ... \| ssh ...` | as the program wrote it | same |
+| .NET calls | `[System.IO.File]::WriteAllLines(...)` / `WriteAllText(...)` | CRLF / exactly as given | same |
+| Files Python writes itself | `open(p, 'w').write('a\n')` | CRLF, and the system code page (cp932) unless `encoding=` is given | same |
+| What the tool returns to the client | the text shown as the call's result | as the commands wrote it (CRLF and lone CR are passed on) | same |
+
+Native programs write their own bytes: since pwsh 7.4, `native > file` and `native | native` pass them through unchanged, so this fork leaves them as the program wrote them. Python's `-u` does not change that; it only turns off buffering. To get LF from a native program, pass its output through a cmdlet (`native | Set-Content f`), or, in Python, use `sys.stdout.reconfigure(newline='\n')` or `open(p, 'w', encoding='utf-8', newline='\n')`.
+
+To get Windows line endings inside one command while the mode is `lf` (each checked on 2026-10-02):
+
+| Write this | Result |
+|---|---|
+| `-Encoding utf8` on a cmdlet | That file is CRLF, UTF-8 without a BOM. |
+| `-Encoding utf8BOM` on a cmdlet | That file is CRLF, UTF-8 with a BOM. |
+| `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)` | Native stdin is CRLF, without a BOM, for the rest of the command. |
+| `$PSDefaultParameterValues.Clear()` | The file-writing cmdlets go back to their defaults (CRLF, no BOM) for the rest of the command. |
+
+How it works: the LF mode uses a small .NET encoding, `src/windows_mcp/powershell/lf_encoding.cs`, that drops a CR only when an LF follows it, also when the two arrive in separate writes. It is assigned to `$OutputEncoding` and, through `$PSDefaultParameterValues`, to the `-Encoding` of the file-writing cmdlets, so an explicit `-Encoding` still wins. The C# is compiled once with `Add-Type` into `~/.windows-mcp/cache/lf-encoding-<key>.dll` (the key changes when the C# source or `pwsh.exe` changes), checked, and loaded at the start of each call, which costs about 30 ms. If it cannot be built, calls run in `native` mode and the call log gets one `newline_setup_failed` record; the server tries again after a restart. Windows PowerShell 5.1 cannot pass an encoding object to these cmdlets, so it stays on CRLF with only the BOM removed. Deleting the cache folder is safe; it is rebuilt on the next call.
+
 ### Tool call log
 
 Every tool call writes a `start` and an `end` record to `~/.windows-mcp/calls.log` as JSON lines, plus a `cancelled` record if the host gives up first. Jobs add `job_start` and `job_end` records, and `job_adopted` when a new server takes over the record of a job from an earlier run.
@@ -329,6 +374,7 @@ A call the host abandoned (illustrative values, in the format the server writes)
 | `WINDOWS_MCP_CALLLOG_MAX_BYTES` | `1000000` | Rotation threshold in bytes |
 | `WINDOWS_MCP_CALLLOG_BACKUPS` | `3` | Older generations to keep |
 | `WINDOWS_MCP_WRITE_LINE_ENDING` | `keep` | Default line endings for FileSystem `write`: `keep`, `lf` or `crlf` |
+| `WINDOWS_MCP_POWERSHELL_NEWLINE` | `lf` | Line endings of text the PowerShell tool writes: `lf` or `native` (CRLF). See [Line endings and BOM in PowerShell](#line-endings-and-bom-in-powershell). |
 
 `PYTHONIOENCODING` is set to `utf-8` only when it is not already set, and a command can still override it.
 
@@ -336,7 +382,7 @@ A call the host abandoned (illustrative values, in the format the server writes)
 
 - PowerShell reports a failing native command as exit code 1. Append `; exit $LASTEXITCODE` to pass the original code on. This is unchanged upstream behaviour.
 - Text output is UTF-8 end to end for PowerShell itself and for the programs checked on 2026-09-26 (`cmd`, `dir`, `where`, `findstr`, git, node, and Python with the default above). The exception is older tools that read text piped into them in the system's ANSI code page, such as `sort.exe` on a Japanese system; setting `[Console]::InputEncoding` does not change that. Use the PowerShell equivalent (`Sort-Object`) instead.
-- Tests: 572 passed, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py`, `tests/test_job_lifecycle.py`, `tests/test_python_io_encoding.py` and `tests/test_line_endings.py`.
+- Tests: 634 passed on 2026-10-02, against an upstream baseline of 508. The new tests are `tests/test_kill_bounds.py`, `tests/test_calllog.py`, `tests/test_powershell_jobs.py`, `tests/test_job_lifecycle.py`, `tests/test_python_io_encoding.py`, `tests/test_line_endings.py`, `tests/test_known_folder_env.py`, `tests/test_text_mode_capture.py` and `tests/test_powershell_newline.py`.
 
 ### License
 
