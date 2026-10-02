@@ -10,7 +10,7 @@ import shutil
 import subprocess
 
 from windows_mcp.desktop.utils import is_elevated
-from windows_mcp.powershell import jobs
+from windows_mcp.powershell import jobs, newline
 from windows_mcp.powershell.utils import run_with_graceful_timeout
 
 __all__ = ["PowerShellExecutor"]
@@ -229,17 +229,20 @@ def _prepare_env() -> dict[str, str]:
 
 def _build_invocation(command: str, shell: str | None) -> tuple[list[str], dict[str, str], str]:
     """Return (args, env, cwd) for running *command* in PowerShell."""
-    # $OutputEncoding: controls how PS5.1 encodes output written to its stdout pipe.
-    # Without this set to UTF-8, PS5.1 uses the system codepage and native process
-    # stdout is silently lost when Python reads the pipe.
+    env = _prepare_env()
+    shell = shell or ("pwsh" if shutil.which("pwsh") else "powershell")
+    # $OutputEncoding: how PS encodes text it writes to a native command's stdin
+    # (and, in PS5.1, its own stdout pipe). Without UTF-8 there, PS5.1 uses the
+    # system codepage and native process stdout is silently lost when Python
+    # reads the pipe. newline.preamble() sets it to UTF-8 without a BOM, and in
+    # "lf" mode also makes cmdlets that write files use LF; see newline.py.
     # [Console]::OutputEncoding: controls how PS decodes bytes from native exe stdout.
     utf8_command = (
-        "$OutputEncoding = [System.Text.Encoding]::UTF8; "
-        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-        f"{command}"
+        newline.preamble(shell, env)
+        + "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+        + command
     )
     encoded = base64.b64encode(utf8_command.encode("utf-16le")).decode("ascii")
-    env = _prepare_env()
     # NO_COLOR suppresses ANSI escape sequences in pwsh 7.2+ (and many other CLI tools).
     # PS5.1 has no ANSI output, so this is harmlessly ignored there.
     # https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_ansi_terminals#disabling-ansi-output
@@ -251,8 +254,6 @@ def _build_invocation(command: str, shell: str | None) -> tuple[list[str], dict[
     # override it with $env:PYTHONIOENCODING. File I/O (open()) is unaffected.
     if not env.get("PYTHONIOENCODING"):
         env["PYTHONIOENCODING"] = "utf-8"
-
-    shell = shell or ("pwsh" if shutil.which("pwsh") else "powershell")
 
     args = [shell, "-NoProfile"]
     # Only older Windows PowerShell (5.1) uses -OutputFormat Text successfully here
