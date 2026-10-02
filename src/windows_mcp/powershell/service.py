@@ -130,6 +130,7 @@ def _known_folder_path(folder_id: str) -> str | None:
             except Exception:
                 logger.debug("Failed to free known folder path buffer", exc_info=True)
 
+
 def _prepare_env() -> dict[str, str]:
     """Prepare a complete environment block for the PowerShell subprocess.
 
@@ -214,11 +215,15 @@ def _prepare_env() -> dict[str, str]:
     # then fails: Win32 OpenSSH, for example, aborts during startup with exit
     # code 255 and no diagnostics at all when ProgramData is absent, which makes
     # every ssh/scp/sftp/ssh-keygen call look like an unexplained failure.
+    # Names are compared case-insensitively, as Windows does: os.environ keys
+    # are upper-case, so "ProgramData" must not be added next to "PROGRAMDATA".
+    present = {key.upper() for key, value in env.items() if value}
     for _name, _folder_id in _KNOWN_FOLDER_ENV_VARS:
-        if not env.get(_name):
+        if _name.upper() not in present:
             _path = _known_folder_path(_folder_id)
             if _path:
                 env[_name] = _path
+                present.add(_name.upper())
     return env
 
 
