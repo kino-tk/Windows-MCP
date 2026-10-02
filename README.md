@@ -15,6 +15,7 @@ Under Claude Desktop, an MSIX-packaged host, Windows-MCP had these practical pro
 4. **When a call did hang, nothing showed which tool or command it was.** The host's log records only that a `tools/call` was sent.
 5. **Japanese text printed by Python came back garbled.** With its output captured, Python writes in the Windows code page (cp932 here), while the server reads the output as UTF-8.
 6. **Files written by the FileSystem tool always had CRLF line endings.** I move files back and forth between Linux and Windows, and because the two use different line endings I had to check them every time, which was tedious. I wanted files that I bring down to Windows to keep LF line endings, so I added a way to choose them.
+7. **Text that PowerShell wrote for other programs had a BOM and CRLF line endings.** Text piped from the `PowerShell` tool into `ssh` arrived on Linux with three stray bytes in front and a CR at the end of every line, and files written with `Set-Content` or `>` came out with CRLF. See [Line endings and BOM in PowerShell](#line-endings-and-bom-in-powershell).
 
 ### Installation
 
@@ -23,8 +24,10 @@ The upstream instructions further down (`uvx windows-mcp`, PyPI, the Claude Desk
 1. Clone the fork. [uv](https://docs.astral.sh/uv/) is required; it fetches Python 3.14 and the dependencies on the first run.
 
    ```powershell
-   git clone https://github.com/kino-tk/Windows-MCP-private.git C:\path\to\Windows-MCP-private
+   git clone https://github.com/kino-tk/Windows-MCP.git C:\path\to\Windows-MCP
    ```
+
+   `C:\path\to\Windows-MCP` is only an example: clone into any folder you like, and use that same folder wherever this section shows `C:\path\to\Windows-MCP` (the `claude_desktop_config.json` entries and the script paths below).
 
 2. Add the server to `claude_desktop_config.json` (for Claude Desktop: `%APPDATA%\Claude\claude_desktop_config.json`, also reachable from Settings → Developer → Edit Config):
 
@@ -33,7 +36,7 @@ The upstream instructions further down (`uvx windows-mcp`, PyPI, the Claude Desk
      "mcpServers": {
        "windows-mcp": {
          "command": "uv",
-         "args": ["--directory", "C:\\path\\to\\Windows-MCP-private", "run", "windows-mcp", "serve"]
+         "args": ["--directory", "C:\\path\\to\\Windows-MCP", "run", "windows-mcp", "serve"]
        }
      }
    }
@@ -43,7 +46,7 @@ The upstream instructions further down (`uvx windows-mcp`, PyPI, the Claude Desk
 
 3. **Restart Claude Desktop** to load the server. Quit it completely, including the tray icon and any Claude processes left in Task Manager, then start it again.
 
-Verified on 2026-09-26: a fresh clone started this way lists 21 tools, including `PowerShellJob`.
+Verified on 2026-09-26: a fresh clone of this code, started this way, lists 21 tools, including `PowerShellJob`.
 
 ### Changes
 
@@ -160,7 +163,7 @@ Normally `PowerShellJob action=kill job_id=<id>` is enough, and if the server it
 1. **Find the PID.** If the server answers, `PowerShellJob action=list` shows it. If not, run the report script from the clone. It reads every record (`~/.windows-mcp/jobs/*.json`) and prints all its fields, plus two live checks: `Running` is `True` only if the recorded PID still belongs to the same process (same PID *and* same start time), and `Server` says whether the owning server is still running. Add `-Tail 20` to see the last 20 lines of each job's output.
 
    ```powershell
-   powershell -ExecutionPolicy Bypass -File C:\path\to\Windows-MCP-private\scripts\windows-mcp-jobs.ps1
+   powershell -ExecutionPolicy Bypass -File C:\path\to\Windows-MCP\scripts\windows-mcp-jobs.ps1
    ```
 
    ```text
@@ -193,7 +196,7 @@ Normally `PowerShellJob action=kill job_id=<id>` is enough, and if the server it
 2. **Kill it, only if `Running` is `True`.** Either let the script do it, which re-checks the PID and lists what it will kill:
 
    ```powershell
-   powershell -ExecutionPolicy Bypass -File C:\path\to\Windows-MCP-private\scripts\windows-mcp-jobs.ps1 -Kill job-3
+   powershell -ExecutionPolicy Bypass -File C:\path\to\Windows-MCP\scripts\windows-mcp-jobs.ps1 -Kill job-3
    ```
 
    or run taskkill yourself with the PID from step 1:
@@ -250,7 +253,7 @@ What is not covered: a program that is not a descendant of the command, because 
   "mcpServers": {
     "windows-mcp": {
       "command": "uv",
-      "args": ["--directory", "C:\\path\\to\\Windows-MCP-private", "run", "windows-mcp", "serve"],
+      "args": ["--directory", "C:\\path\\to\\Windows-MCP", "run", "windows-mcp", "serve"],
       "env": {
         "WINDOWS_MCP_JOB_SWEEP_INTERVAL": "600",
         "WINDOWS_MCP_JOB_RETENTION_HOURS": "24"
@@ -327,6 +330,17 @@ To get Windows line endings inside one command while the mode is `lf` (each chec
 | `$PSDefaultParameterValues.Clear()` | The file-writing cmdlets go back to their defaults (CRLF, no BOM) for the rest of the command. |
 
 How it works: the LF mode uses a small .NET encoding, `src/windows_mcp/powershell/lf_encoding.cs`, that drops a CR only when an LF follows it, also when the two arrive in separate writes. It is assigned to `$OutputEncoding` and, through `$PSDefaultParameterValues`, to the `-Encoding` of the file-writing cmdlets, so an explicit `-Encoding` still wins. The C# is compiled once with `Add-Type` into `~/.windows-mcp/cache/lf-encoding-<key>.dll` (the key changes when the C# source or `pwsh.exe` changes), checked, and loaded at the start of each call, which costs about 30 ms. If it cannot be built, calls run in `native` mode and the call log gets one `newline_setup_failed` record; the server tries again after a restart. Windows PowerShell 5.1 cannot pass an encoding object to these cmdlets, so it stays on CRLF with only the BOM removed. Deleting the cache folder is safe; it is rebuilt on the next call.
+
+#### The one-time build of the line-ending helper (C# to DLL)
+
+You do not need to install anything for this, and you do not need to do anything by hand.
+
+- **What it is.** LF mode needs a small piece of .NET code that PowerShell can use as a text encoding. Its source is the C# file `src/windows_mcp/powershell/lf_encoding.cs` in this repository (about 100 lines, readable as plain text).
+- **When it is built.** The first time the `PowerShell` tool runs a command in LF mode, the server asks PowerShell to compile that file with `Add-Type`. PowerShell 7 carries its own C# compiler, so Visual Studio and the .NET SDK are not needed. The server then runs a short self-check on the result (CRLF must become LF, a lone CR must stay, no BOM) before using it.
+- **How long it takes.** About 1.2 seconds, once, on the first call (measured 2026-10-02 with pwsh 7.6.6). After that the compiled file is only loaded, which adds about 30 ms to each call.
+- **Where it goes.** `~/.windows-mcp/cache/lf-encoding-<key>.dll`, about 4 KB. Nothing is downloaded and nothing outside that folder is written. The DLL is a generated file and is not part of the repository; only the C# source is.
+- **When it is rebuilt.** The `<key>` in the name comes from the C# source and from the `pwsh.exe` being used, so editing the source or updating PowerShell makes the server build a new one automatically. Old ones can be deleted at any time; the folder can also be deleted, and is rebuilt on the next call.
+- **If it cannot be built.** The command still runs, in `native` mode (CRLF, but still no BOM on native stdin), and the call log gets one `newline_setup_failed` record with the reason. The server tries again after it is restarted.
 
 ### Tool call log
 
