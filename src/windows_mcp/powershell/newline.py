@@ -11,9 +11,9 @@ BOM and CRs.
 
 ``WINDOWS_MCP_POWERSHELL_NEWLINE`` selects the behaviour:
 
-``native`` (default)
+``native``
     Keep the Windows line ending. Only the BOM on native stdin is dropped.
-``lf``
+``lf`` (default in this fork)
     Write LF instead of CRLF, without a BOM, on all of the paths above. This
     uses a small .NET encoding (``lf_encoding.cs``) that drops a CR only
     when an LF follows it, so a lone CR, such as a progress line redrawn in
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 MODE_ENV = "WINDOWS_MCP_POWERSHELL_NEWLINE"
 MODES = ("native", "lf")
-DEFAULT_MODE = "native"
+DEFAULT_MODE = "lf"
 
 CLASS_NAME = "WindowsMcp.Text.LfUtf8Encoding"
 
