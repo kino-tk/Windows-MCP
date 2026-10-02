@@ -15,6 +15,16 @@ from windows_mcp.tree.views import BoundingBox, Center, TreeElementNode, ScrollE
 from windows_mcp.desktop.views import Window, Status, DesktopState
 
 
+
+@pytest.fixture(autouse=True)
+def _newline_cache_in_tmp(tmp_path_factory, monkeypatch):
+    # Keep the suite from compiling the LF encoding into the user's real
+    # ~/.windows-mcp/cache. One folder per session, so it is built once.
+    from windows_mcp.powershell import newline
+
+    cache = tmp_path_factory.getbasetemp() / "newline-cache"
+    monkeypatch.setattr(newline, "cache_dir", lambda: cache)
+
 @pytest.fixture
 def sample_bounding_box():
     return BoundingBox(left=100, top=50, right=300, bottom=150, width=200, height=100)
