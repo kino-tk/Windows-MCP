@@ -1,6 +1,8 @@
+import locale
 import logging
 import signal
 import subprocess
+import sys
 import tempfile
 from xml.sax.saxutils import escape as xml_escape
 
@@ -119,6 +121,21 @@ def _drain(handle) -> bytes | None:
         return b""
 
 
+def _as_text(process: subprocess.Popen, data: bytes | None):
+    """Decode captured bytes the way ``subprocess`` does in text mode.
+
+    The capture files are binary, so ``text``/``universal_newlines``/
+    ``encoding``/``errors`` would otherwise have no effect on the result.
+    Mirrors ``Popen``: the given encoding, else the locale encoding (UTF-8 in
+    UTF-8 mode); the given errors, else strict; newlines translated to ``\\n``.
+    """
+    if data is None or not process.text_mode:
+        return data
+    encoding = process.encoding or ("utf-8" if sys.flags.utf8_mode else locale.getencoding())
+    text = data.decode(encoding, process.errors or "strict")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def run_with_graceful_timeout(
         *popenargs,
         input=None,
@@ -232,8 +249,8 @@ def run_with_graceful_timeout(
                 raise
 
             retcode = process.returncode
-            stdout = _drain(out_file)
-            stderr = _drain(err_file)
+            stdout = _as_text(process, _drain(out_file))
+            stderr = _as_text(process, _drain(err_file))
             args = process.args
         finally:
             for pipe in (process.stdin, process.stdout, process.stderr):
