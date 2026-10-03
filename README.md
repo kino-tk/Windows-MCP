@@ -24,8 +24,10 @@ The upstream instructions further down (`uvx windows-mcp`, PyPI, the Claude Desk
 1. Clone the fork. [uv](https://docs.astral.sh/uv/) is required; it fetches Python 3.14 and the dependencies on the first run.
 
    ```powershell
-   git clone https://github.com/kino-tk/Windows-MCP.git C:\path\to\Windows-MCP
+   git clone -b kino https://github.com/kino-tk/Windows-MCP.git C:\path\to\Windows-MCP
    ```
+
+   These changes live on the `kino` branch, which `-b kino` selects. The fork's `main` branch is kept as an unchanged copy of upstream `main` (it is the base for pull requests to upstream), so a clone without `-b kino` gets the upstream code. To update an existing clone later, run `git pull` in it.
 
    `C:\path\to\Windows-MCP` is only an example: clone into any folder you like, and use that same folder wherever this section shows `C:\path\to\Windows-MCP` (the `claude_desktop_config.json` entries and the script paths below).
 
