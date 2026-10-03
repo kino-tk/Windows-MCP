@@ -48,7 +48,7 @@ The upstream instructions further down (`uvx windows-mcp`, PyPI, the Claude Desk
 
 3. **Restart Claude Desktop** to load the server. Quit it completely, including the tray icon and any Claude processes left in Task Manager, then start it again.
 
-Verified on 2026-09-26: a fresh clone of this code, started this way, lists 21 tools, including `PowerShellJob`.
+Verified on 2026-10-03: a fresh clone of the `kino` branch, started this way, lists 21 tools, including `PowerShellJob`.
 
 ### Changes
 
