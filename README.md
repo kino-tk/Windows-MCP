@@ -69,6 +69,7 @@ Verified on 2026-10-03: a fresh clone of the `kino` branch, started this way, li
 | `bed5411` | `powershell/service.py` | Do not add a known-folder variable again under a different letter case. |
 | `bde57ad` | `powershell/newline.py` (new), `powershell/lf_encoding.cs` (new), `powershell/service.py`, `pyproject.toml` | Choose LF or CRLF for text PowerShell writes, and stop writing a BOM to native stdin. See [Line endings and BOM in PowerShell](#line-endings-and-bom-in-powershell). |
 | `af369ed` | `powershell/newline.py` | This fork writes LF by default. |
+| `6b0144c` | `powershell/service.py`, `tools/shell.py` | `return_id` for PowerShell: start the command as a background job and get its job id back at once, without waiting. See [Long commands](#long-commands-timeout-and-powershelljob). |
 
 Paths are under `src/windows_mcp/`, except `scripts/`.
 
@@ -77,7 +78,7 @@ Paths are under `src/windows_mcp/`, except `scripts/`.
 #### Command syntax
 
 ```text
-PowerShell     command=<string> [timeout=<seconds>]
+PowerShell     command=<string> [timeout=<seconds>] [return_id=true]
 
 PowerShellJob  action=list
 PowerShellJob  action=status  job_id=<id> [tail_chars=<n>]
@@ -93,6 +94,7 @@ PowerShellJob  action=kill    job_id=<id>
 |---|---|---|---|
 | `command` | PowerShell | (required) | The PowerShell command line to run. |
 | `timeout` | PowerShell | `30` | Hard limit in seconds; the command is killed when it expires. No upper bound. |
+| `return_id` | PowerShell | `false` | `true` starts the command as a background job and returns its job id at once, without waiting. `timeout` stays the hard limit. Collect the result with `PowerShellJob`. |
 | `action` | PowerShellJob | `wait` | `wait`, `status`, `kill` or `list`. |
 | `job_id` | PowerShellJob | (required except for `list`) | The id returned by PowerShell, for example `job-1`. |
 | `wait_seconds` | PowerShellJob | `60` | For `wait`: how long to block. Capped per call at `WINDOWS_MCP_JOB_RETURN_AFTER` seconds (200 by default, at most 225). |
@@ -102,7 +104,8 @@ PowerShellJob  action=kill    job_id=<id>
 
 - If `timeout` is longer than about 200 s and the command is still running at that point, the PowerShell call returns early with the output so far, `Status Code: running` and a job id. The command keeps running.
 - A command that finishes within 200 s returns exactly what a plain call would.
-- Calls whose `timeout` is 200 s or less take the pre-job code path (`execute_command`), which still has the bounded waits added in `f789895`.
+- Calls whose `timeout` is 200 s or less, without `return_id=true`, take the pre-job code path (`execute_command`), which still has the bounded waits added in `f789895`.
+- With `return_id=true` the command always runs as a job, whatever `timeout` is, and the call returns at once with `Status Code: running` and the job id. Nothing is waited for, so even a command that finishes in a second is collected with `PowerShellJob`. Use it for a command you expect to take long, so you can do other work while it runs. Set `timeout` to fit the command: if you leave it out, the default 30 s still stops the command.
 - `wait` returns the full output and the exit code once the command has finished. If it is still running, `wait` returns the latest output with `Status Code: running`; call it again.
 - `status` returns at once. `kill` stops the command and every process it started. `list` shows every job with its state.
 - Output is written to files, so it can be read while the command runs. Programs must print progressively to show partial output (for Python, use `-u`). Interactive prompts are not supported.
@@ -139,6 +142,20 @@ PowerShellJob action=list
 ```
 
 The first and third results are from a verified run under Claude Desktop.
+
+With `return_id=true` the call comes back at once (0.03 s in a local run of a 5 s command):
+
+```text
+PowerShell    command="ssh host 'long-task.sh'" timeout=600 return_id=true
+  -> Started in the background as job-1 (PID 4196) without waiting (return_id=true); it is
+     stopped at its hard timeout of 600s (at 21:15:00) if it has not finished.
+     Use the PowerShellJob tool with job_id="job-1": action="wait" to wait for it (up to 200s
+     per call), action="status" for output so far, action="kill" to stop it.
+     Status Code: running
+
+PowerShellJob job_id=job-1 wait_seconds=200
+  -> (as above: the latest output with Status Code: running, or the full output once it has finished)
+```
 
 #### Listing jobs
 
