@@ -256,3 +256,86 @@ def test_normal_call_is_not_blocked_by_a_running_job():
     quick, quick_elapsed, slow = asyncio.run(scenario())
     assert "fast" in quick and quick_elapsed < 1.5
     assert "slow" in slow and slow.endswith("Status Code: 0")
+
+
+# --- return_id: start the command as a job and return at once ---------------
+
+
+def test_return_id_returns_at_once_and_wait_collects(monkeypatch):
+    monkeypatch.setenv("WINDOWS_MCP_JOB_RETURN_AFTER", "10")
+    cmd = _py("import time\nprint('begin')\ntime.sleep(3)\nprint('end')")
+    started = time.monotonic()
+    out, status, job_id = PowerShellExecutor.run(cmd, timeout=600, return_id=True)
+    elapsed = time.monotonic() - started
+    assert elapsed < 2.5  # far below return_after (10 s) and the command's own 3 s
+    assert status is None and job_id and job_id.startswith("job-")
+    assert "without waiting" in out and f'job_id="{job_id}"' in out
+    job = jobs.get(job_id)
+    assert job is not None and not job.done.is_set()
+    assert job.done.wait(20)
+    final, code = job_finished_output(job)
+    assert code == 0 and job.state == "exited"
+    assert [ln for ln in final.splitlines() if ln in ("begin", "end")] == ["begin", "end"]
+
+
+def test_return_id_uses_a_job_even_for_a_short_timeout(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        PowerShellExecutor,
+        "execute_command",
+        staticmethod(lambda *a, **k: calls.append(a) or ("", 0)),
+    )
+    out, status, job_id = PowerShellExecutor.run("'quick'", timeout=5, return_id=True)
+    assert calls == []  # the pre-job path is not taken
+    assert status is None and job_id
+    job = jobs.get(job_id)
+    assert job.hard_timeout == 5
+    assert job.done.wait(20)
+    final, code = job_finished_output(job)
+    assert (final.strip(), code) == ("quick", 0)
+
+
+def test_return_id_keeps_the_hard_timeout():
+    started = time.monotonic()
+    out, status, job_id = PowerShellExecutor.run(
+        _py("import time; time.sleep(60)"), timeout=2, return_id=True
+    )
+    assert time.monotonic() - started < 2
+    job = jobs.get(job_id)
+    assert job.done.wait(30)
+    assert job.state == "timed_out"
+    final, code = job_finished_output(job)
+    assert code == 1 and "hard timeout of 2s" in final
+
+
+def test_tool_return_id_end_to_end(job_env):
+    import json
+
+    from fastmcp import FastMCP
+    from windows_mcp.tools.shell import register
+
+    mcp = FastMCP(name="t3")
+    register(mcp, get_desktop=lambda: None, get_analytics=lambda: None)
+
+    async def scenario():
+        cmd = _py("import time\nprint('begin')\ntime.sleep(2)\nprint('end')")
+        t0 = time.monotonic()
+        first = _text(await mcp.call_tool("PowerShell", {"command": cmd, "return_id": True}))
+        first_elapsed = time.monotonic() - t0
+        job_id = re.search(r'job_id="(job-\d+)"', first).group(1)
+        waited = ""
+        for _ in range(6):
+            waited = _text(await mcp.call_tool("PowerShellJob", {"job_id": job_id, "wait_seconds": 2}))
+            if not waited.endswith("Status Code: running"):
+                break
+        return first, first_elapsed, job_id, waited
+
+    first, first_elapsed, job_id, waited = asyncio.run(scenario())
+    assert first_elapsed < 2.5 and first.endswith("Status Code: running")
+    assert "without waiting" in first
+    assert f"{job_id} finished: exited, exit 0" in waited and waited.endswith("Status Code: 0")
+    assert "begin" in waited and "end" in waited
+    log = job_env.parent / "calls.log"
+    recs = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    starts = [r for r in recs if r["event"] == "start" and r["tool"] == "Powershell-Tool"]
+    assert starts and starts[-1]["args"]["return_id"] is True

@@ -298,6 +298,18 @@ def job_running_message(job: jobs.Job, waited: float, tail_chars: int = 4000) ->
     return "\n".join(lines)
 
 
+def job_started_message(job: jobs.Job) -> str:
+    """Reply to a call with return_id=True: the job was started and nothing was awaited."""
+    return "\n".join([
+        f"Started in the background as {job.id} (PID {job.pid}) without waiting (return_id=true); "
+        f"it is stopped at its hard timeout of {job.hard_timeout:.0f}s "
+        f"(at {job.deadline_text()}) if it has not finished.",
+        f'Use the PowerShellJob tool with job_id="{job.id}": action="wait" to wait for it '
+        f'(up to {jobs.return_after():.0f}s per call), action="status" for output so far, '
+        f'action="kill" to stop it.',
+    ])
+
+
 def job_finished_output(job: jobs.Job) -> tuple[str, int]:
     """Full output of a finished job, formatted like a normal call's."""
     stdout, stderr = jobs.read_output(job)
@@ -339,7 +351,7 @@ class PowerShellExecutor:
 
     @staticmethod
     def run(
-            command: str, timeout: int = 30, shell: str | None = None
+            command: str, timeout: int = 30, shell: str | None = None, return_id: bool = False
     ) -> tuple[str, int | None, str | None]:
         """Run *command*, handing it over as a job if it outlives one call.
 
@@ -348,9 +360,13 @@ class PowerShellExecutor:
         the command runs as a job; if it finishes within ``return_after()``
         the result is identical to a normal call, and if not, the output so
         far is returned with ``status_code`` None and the job id.
+
+        With *return_id* the command always runs as a job, whatever *timeout*
+        is, and the call returns at once with ``status_code`` None and the job
+        id, without waiting for any of it.
         """
         wait = jobs.return_after()
-        if timeout <= wait:
+        if timeout <= wait and not return_id:
             output, status = PowerShellExecutor.execute_command(command, timeout, shell)
             return output, status, None
         try:
@@ -358,6 +374,8 @@ class PowerShellExecutor:
             job = jobs.start(args, env=env, cwd=cwd, hard_timeout=timeout, command=command)
         except Exception as e:
             return f"Command execution failed: {type(e).__name__}: {e}", 1, None
+        if return_id:
+            return job_started_message(job), None, job.id
         if job.done.wait(wait):
             output, status = job_finished_output(job)
             # Finished within the first call: behave exactly like a plain call,

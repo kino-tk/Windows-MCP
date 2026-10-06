@@ -33,7 +33,11 @@ def register(mcp, *, get_desktop, get_analytics):
             "in the background. Then use the PowerShellJob tool to wait for it, check its output, or kill it. "
             "Do not use Start-Sleep polling loops for this. Output is read from files, so print progressively "
             "(e.g. python -u) if you want to see it while the command runs. Interactive prompts are not "
-            "supported."
+            "supported.\n\n"
+            "return_id=true starts the command as a background job and returns its job_id at once, "
+            "without waiting, whatever timeout is (timeout stays the hard limit). Use it only for commands "
+            "you expect to take long and want to leave running while you do other work, then collect the "
+            "result with PowerShellJob. The default false keeps the behaviour described above."
         ),
         annotations=ToolAnnotations(
             title="PowerShell",
@@ -44,9 +48,13 @@ def register(mcp, *, get_desktop, get_analytics):
         ),
     )
     @with_analytics(get_analytics(), "Powershell-Tool")
-    def powershell_tool(command: str, timeout: int = 30, ctx: Context = None) -> str:
+    def powershell_tool(
+        command: str, timeout: int = 30, return_id: bool = False, ctx: Context = None
+    ) -> str:
         try:
-            response, status_code, job_id = PowerShellExecutor.run(command, timeout)
+            response, status_code, job_id = PowerShellExecutor.run(
+                command, timeout, return_id=return_id
+            )
             if job_id is not None:
                 return _response(response, "running")
             return _response(response, status_code)
@@ -57,7 +65,8 @@ def register(mcp, *, get_desktop, get_analytics):
         name="PowerShellJob",
         description=(
             "Manage PowerShell commands that are still running in the background after the PowerShell tool "
-            "returned 'Status Code: running' with a job_id. action='wait' blocks up to wait_seconds (capped at "
+            "returned 'Status Code: running' with a job_id (it always does with return_id=true). "
+            "action='wait' blocks up to wait_seconds (capped at "
             "about 200 s per call) and returns the full output with the exit code once the command has finished, "
             "or the latest output if it is still running; call it again to keep waiting. action='status' returns "
             "immediately. action='kill' stops the command and its child processes. action='list' shows all jobs "
